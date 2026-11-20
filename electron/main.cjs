@@ -1,4 +1,5 @@
 const { app, BrowserWindow, ipcMain, session } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const cheerio = require('cheerio');
 
@@ -826,9 +827,23 @@ function createWindow() {
   }
 }
 
+function checkForUpdates() {
+  if (!app.isPackaged) return;
+
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.on('error', (error) => {
+    console.warn('VBook update check failed:', error.message);
+  });
+  autoUpdater.checkForUpdatesAndNotify().catch((error) => {
+    console.warn('VBook update check failed:', error.message);
+  });
+}
+
 app.whenReady().then(() => {
   setupIpcHandlers();
   createWindow();
+  checkForUpdates();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

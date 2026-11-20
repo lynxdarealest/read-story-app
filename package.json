@@ -1,7 +1,7 @@
 {
   "name": "react-example",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -9,6 +9,7 @@
     "build": "vite build",
     "start": "node server.ts",
     "desktop": "electron .",
+    "release:win": "npm run build && electron-builder --win nsis --publish always",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
@@ -20,6 +21,7 @@
     "@vitejs/plugin-react": "^6.1.1",
     "cheerio": "^1.2.0",
     "dotenv": "^17.2.3",
+    "electron-updater": "^6.8.11",
     "express": "^4.21.2",
     "jszip": "^3.10.2",
     "lucide-react": "^0.546.0",
@@ -29,14 +31,50 @@
     "vite": "^8.3.0"
   },
   "devDependencies": {
+    "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "autoprefixer": "^10.4.21",
-    "esbuild": "^0.25.0",
+    "electron": "^39.2.7",
+    "electron-builder": "^26.0.12",
+    "esbuild": "^0.28.2",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
-    "typescript": "^7.0.2",
-    "@types/express": "^4.17.21"
+    "typescript": "^7.0.2"
+  },
+  "build": {
+    "appId": "com.vbook.desktop",
+    "productName": "VBook Desktop",
+    "asar": true,
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "lynxdarealest",
+        "repo": "read-story-app"
+      }
+    ]
+  },
+  "allowScripts": {
+    "electron@39.8.10": true,
+    "electron-winstaller@5.4.0": true,
+    "esbuild@0.28.2": true
   }
 }

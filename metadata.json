@@ -1,0 +1,6 @@
+{
+  "name": "VBook Desktop - Trình Đọc Truyện Offline Cho Windows",
+  "description": "Ứng dụng đọc truyện chữ local-first chuyên nghiệp cho Windows, lấy cảm hứng từ VBook. Hỗ trợ TXT, EPUB, tự động tách chương, đọc TTS offline và từ điển riêng từng truyện.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

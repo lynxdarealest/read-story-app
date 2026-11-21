@@ -11,6 +11,7 @@ export interface DesktopFetchChapterResult {
 export interface DesktopBridgeApi {
   isElectron: boolean;
   translate: (joinedPayload: string) => Promise<string>;
+  analyzePhrase?: (phrase: string) => Promise<{ vi?: string; nameEng?: string }>;
   inspectUrl: (url: string, cookie?: string) => Promise<WebNovelInspectResult>;
   fetchChapter: (params: {
     url: string;

@@ -133,8 +133,57 @@ export function applyDictionaryToText(
   return out;
 }
 
+const HIGHLIGHT_COLOR_CLASSES: Record<'yellow' | 'green' | 'blue' | 'pink' | 'purple', string> = {
+  yellow: 'bg-amber-400/35 text-inherit rounded px-0.5 border-b border-amber-400/70',
+  green: 'bg-emerald-400/30 text-inherit rounded px-0.5 border-b border-emerald-400/70',
+  blue: 'bg-sky-400/30 text-inherit rounded px-0.5 border-b border-sky-400/70',
+  pink: 'bg-pink-400/30 text-inherit rounded px-0.5 border-b border-pink-400/70',
+  purple: 'bg-purple-400/30 text-inherit rounded px-0.5 border-b border-purple-400/70',
+};
+
 /**
- * Export dictionary entries to VietPhrase / VBook compatible TXT format (A=B)
+ * Overlay saved text highlights onto already-escaped HTML (preserving existing <span> tags).
+ */
+export function applyHighlightsToHtml(
+  safeHtml: string,
+  highlights: Array<{ id: string; text: string; color: 'yellow' | 'green' | 'blue' | 'pink' | 'purple' }>
+): string {
+  if (!safeHtml || !highlights || highlights.length === 0) return safeHtml;
+
+  const uniqueMap = new Map<string, { id: string; escaped: string; color: 'yellow' | 'green' | 'blue' | 'pink' | 'purple' }>();
+  for (const hl of highlights) {
+    const clean = hl.text.trim();
+    if (!clean || clean.length < 2) continue;
+    const escaped = escapeHtml(clean);
+    if (!uniqueMap.has(escaped)) {
+      uniqueMap.set(escaped, { id: hl.id, escaped, color: hl.color });
+    }
+  }
+
+  const items = Array.from(uniqueMap.values()).sort((a, b) => b.escaped.length - a.escaped.length);
+  if (items.length === 0) return safeHtml;
+
+  const pattern = items.map((item) => escapeRegExp(item.escaped)).join('|');
+  const regex = new RegExp(pattern, 'g');
+
+  // Split by HTML tags so we only replace inside text nodes
+  const parts = safeHtml.split(/(<[^>]+>)/g);
+  for (let i = 0; i < parts.length; i += 2) {
+    const segment = parts[i];
+    if (!segment) continue;
+    parts[i] = segment.replace(regex, (matched) => {
+      const found = uniqueMap.get(matched);
+      if (!found) return matched;
+      const cls = HIGHLIGHT_COLOR_CLASSES[found.color] || HIGHLIGHT_COLOR_CLASSES.yellow;
+      return `<mark data-hl-id="${escapeHtml(found.id)}" class="${cls}">${matched}</mark>`;
+    });
+  }
+
+  return parts.join('');
+}
+
+/**
+ * Export dictionary entries to VietPhrase compatible TXT format (A=B)
  */
 export function exportDictionaryToTxt(entries: DictionaryEntry[]): string {
   return entries

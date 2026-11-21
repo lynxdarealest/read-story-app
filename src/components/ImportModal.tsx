@@ -263,15 +263,17 @@ export const ImportModal: React.FC<ImportModalProps> = ({
   };
 
   const handleMergeWithPrevious = (index: number) => {
-    if (index === 0) return;
+    if (index <= 0) return;
     setDraftChapters((prev) => {
       const copy = [...prev];
       const prevCh = copy[index - 1];
       const currCh = copy[index];
-
-      prevCh.content = prevCh.content + '\n\n' + currCh.content;
-      prevCh.wordCount = countWords(prevCh.content);
-
+      const mergedContent = prevCh.content + '\n\n' + currCh.content;
+      copy[index - 1] = {
+        ...prevCh,
+        content: mergedContent,
+        wordCount: countWords(mergedContent),
+      };
       copy.splice(index, 1);
       return copy;
     });
@@ -319,10 +321,11 @@ export const ImportModal: React.FC<ImportModalProps> = ({
     const target = draftChapters[splittingIndex];
     const pos = target.content.indexOf(splitKeyword);
     if (pos === -1) {
-      alert('Không tìm thấy từ khóa tách trong nội dung chương.');
+      setErrorMessage('Không tìm thấy từ khóa tách trong nội dung chương.');
       return;
     }
 
+    setErrorMessage(null);
     const part1Content = target.content.slice(0, pos).trim();
     const part2Content = target.content.slice(pos).trim();
 

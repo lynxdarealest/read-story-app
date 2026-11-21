@@ -55,6 +55,7 @@ import {
 } from '../types';
 import {
   applyDictionaryToText,
+  applyHighlightsToHtml,
   computeDictionarySignature,
   escapeHtml,
   mergeDictionariesByPrecedence
@@ -64,18 +65,23 @@ import {
   translateChapterWithSangTacViet,
   TranslationProgress
 } from '../services/translator';
+import { containsCjk } from '../services/chineseTools';
 import { ttsService, TTSState } from '../services/tts';
 import {
   saveBook,
   saveBookmark,
   getBookmarks,
+  deleteBookmark,
   getDictionaries,
+  saveDictionaryEntry,
   getChapterTranslation,
+  getBookTranslations,
   saveChapterTranslation,
   updateChapter,
   batchUpdateChapters,
   saveHighlight,
-  getHighlights
+  getHighlights,
+  deleteHighlight
 } from '../services/storage';
 import { ReaderTOC } from './ReaderTOC';
 import { ReaderSettingsPanel } from './ReaderSettings';
@@ -87,6 +93,7 @@ import { ThemeManagerModal } from './ThemeManagerModal';
 import { ChapterManagerModal } from './ChapterManagerModal';
 import { ShortcutHelpModal } from './ShortcutHelpModal';
 import { SelectionActionMenu } from './SelectionActionMenu';
+import { QuickNameEditModal, QuickDictScope, QuickReplaceScope } from './QuickNameEditModal';
 import { ReaderFindReplaceModal } from './ReaderFindReplaceModal';
 import { ChapterVersionModal } from './ChapterVersionModal';
 import { ChapterEditorModal } from './ChapterEditorModal';
@@ -154,11 +161,14 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   // Inline paragraph editing
   const [editingParagraphIndex, setEditingParagraphIndex] = React.useState<number | null>(null);
   const [paragraphEditText, setParagraphEditText] = React.useState('');
+  const [confirmDeleteParaIdx, setConfirmDeleteParaIdx] = React.useState<number | null>(null);
   const [isAutoSaving, setIsAutoSaving] = React.useState(false);
   const [lastSavedTimestamp, setLastSavedTimestamp] = React.useState<number | null>(null);
 
-  // Highlights
+  // Highlights & in-app Add Note modal
   const [highlights, setHighlights] = React.useState<Highlight[]>([]);
+  const [pendingNoteModal, setPendingNoteModal] = React.useState<{ text: string; note: string } | null>(null);
+  const pendingSearchJumpRef = React.useRef<{ chapterIndex: number; snippet: string } | null>(null);
 
   // HUD Toast indicator
   const [hudToast, setHudToast] = React.useState<string | null>(null);
@@ -272,13 +282,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const [translationError, setTranslationError] = React.useState<string | null>(null);
   const translationAbortRef = React.useRef<AbortController | null>(null);
 
-  // Floating text selection tooltip
+  // Floating text selection tooltip / quick name editor
   const [selectionTooltip, setSelectionTooltip] = React.useState<{
     x: number;
     y: number;
     text: string;
     paragraphIndex?: number;
+    startInPara?: number;
+    endInPara?: number;
+    mode: 'quick-name' | 'menu';
   } | null>(null);
+  const [searchInitialQuery, setSearchInitialQuery] = React.useState('');
+  const [translatedChaptersForReplace, setTranslatedChaptersForReplace] = React.useState<Chapter[] | null>(null);
 
   // Paginated / two-column mode state
   const [currentPageIndex, setCurrentPageIndex] = React.useState(0);
@@ -440,6 +455,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
       await saveChapterTranslation(result);
       setCurrentTranslation(result);
+      setContinuousTranslations((prev) => ({ ...prev, [result.chapterId]: result }));
       setReadingViewMode('translated');
       setCurrentPageIndex(0);
       setEditingParagraphIndex(null);
@@ -484,6 +500,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
       const nextChapters = localChapters.map((c) => (c.id === chapterId ? updatedChapter : c));
       setLocalChapters(nextChapters);
+      setContinuousTranslations((prev) => {
+        if (!(chapterId in prev)) return prev;
+        const copy = { ...prev };
+        delete copy[chapterId];
+        return copy;
+      });
 
       if (onChaptersUpdated) {
         onChaptersUpdated(nextChapters, book);
@@ -498,7 +520,122 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     }
   };
 
-  const handleBatchUpdateChapters = async (updatedChapters: Chapter[], summary: string) => {
+  const handleSaveTranslatedChapterContent = async (
+    chapterId: string,
+    updatedTitle: string,
+    updatedContent: string
+  ) => {
+    setIsAutoSaving(true);
+    try {
+      const existing =
+        (chapterId === currentChapter.id ? currentTranslation : continuousTranslations[chapterId]) ||
+        (await getChapterTranslation(chapterId));
+
+      if (!existing) {
+        showHUDToast('Chưa có bản dịch để lưu');
+        return;
+      }
+
+      const nextTranslation: ChapterTranslation = {
+        ...existing,
+        translatedTitle: updatedTitle.trim() || existing.translatedTitle,
+        translatedContent: updatedContent,
+        translatedAt: Date.now(),
+      };
+
+      await saveChapterTranslation(nextTranslation);
+
+      if (chapterId === currentChapter.id) {
+        setCurrentTranslation(nextTranslation);
+      }
+      setContinuousTranslations((prev) => ({
+        ...prev,
+        [chapterId]: nextTranslation,
+      }));
+      setLastSavedTimestamp(Date.now());
+      showHUDToast('Đã lưu chỉnh sửa bản dịch');
+    } catch (err: any) {
+      showHUDToast(`Lỗi khi lưu bản dịch: ${err.message}`);
+    } finally {
+      setIsAutoSaving(false);
+    }
+  };
+
+  const handleBatchUpdateTranslatedChapters = async (updatedChapters: Chapter[]) => {
+    setIsAutoSaving(true);
+    try {
+      const existingList = await getBookTranslations(book.id);
+      const transMap = new Map(existingList.map((t) => [t.chapterId, t]));
+      const updatedMap = new Map<string, ChapterTranslation>();
+
+      for (const ch of updatedChapters) {
+        const prev = transMap.get(ch.id);
+        if (!prev) continue;
+        const next: ChapterTranslation = {
+          ...prev,
+          translatedTitle: ch.title || prev.translatedTitle,
+          translatedContent: ch.content,
+          translatedAt: Date.now(),
+        };
+        await saveChapterTranslation(next);
+        updatedMap.set(ch.id, next);
+      }
+
+      if (updatedMap.has(currentChapter.id)) {
+        setCurrentTranslation(updatedMap.get(currentChapter.id)!);
+      }
+      setContinuousTranslations((prev) => {
+        const next = { ...prev };
+        for (const [id, tr] of updatedMap.entries()) {
+          next[id] = tr;
+        }
+        return next;
+      });
+      setTranslatedChaptersForReplace((prev) =>
+        prev
+          ? prev.map((c) => {
+              const updated = updatedMap.get(c.id);
+              return updated
+                ? { ...c, title: updated.translatedTitle, content: updated.translatedContent }
+                : c;
+            })
+          : prev
+      );
+      setLastSavedTimestamp(Date.now());
+      showHUDToast(`Đã lưu bản dịch ${updatedMap.size} chương`);
+    } catch (err: any) {
+      showHUDToast(`Lỗi: ${err.message}`);
+    } finally {
+      setIsAutoSaving(false);
+    }
+  };
+
+  const openFindReplaceModal = async () => {
+    if (isViewingTranslation) {
+      try {
+        const list = await getBookTranslations(book.id);
+        const transMap = new Map(list.map((t) => [t.chapterId, t]));
+        const mapped = localChapters
+          .filter((ch) => transMap.has(ch.id))
+          .map((ch) => {
+            const tr = transMap.get(ch.id)!;
+            return {
+              ...ch,
+              title: tr.translatedTitle || ch.title,
+              content: tr.translatedContent,
+            };
+          });
+        setTranslatedChaptersForReplace(mapped.length > 0 ? mapped : null);
+      } catch {
+        setTranslatedChaptersForReplace(null);
+      }
+    } else {
+      setTranslatedChaptersForReplace(null);
+    }
+    setShowFindReplace(true);
+  };
+
+  const handleBatchUpdateChapters = async (updatedChapters: Chapter[], _summary: string) => {
     setIsAutoSaving(true);
     try {
       await batchUpdateChapters(updatedChapters);
@@ -506,6 +643,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       const updatedMap = new Map(updatedChapters.map((c) => [c.id, c]));
       const nextChapters = localChapters.map((c) => (updatedMap.has(c.id) ? updatedMap.get(c.id)! : c));
       setLocalChapters(nextChapters);
+      setContinuousTranslations((prev) => {
+        const copy = { ...prev };
+        for (const ch of updatedChapters) delete copy[ch.id];
+        return copy;
+      });
 
       if (onChaptersUpdated) {
         onChaptersUpdated(nextChapters, book);
@@ -527,11 +669,192 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     showHUDToast('Đã khôi phục về bản gốc ban đầu');
   };
 
-  // Inline Paragraph Operations
+  // Helper to replace text cleanly in a chapter's displayed translation (1 occurrence or whole chapter)
+  const applyNameReplacement = async (params: {
+    oldText: string;
+    newText: string;
+    scope: QuickReplaceScope;
+    paragraphIndex: number;
+    startInPara: number;
+    endInPara: number;
+  }) => {
+    const { oldText, newText, scope, paragraphIndex, startInPara } = params;
+    if (!oldText || !newText) return;
+
+    if (isViewingTranslation && currentTranslation) {
+      let nextContent = currentTranslation.translatedContent;
+      let nextTitle = currentTranslation.translatedTitle;
+
+      if (scope === 'chapter') {
+        nextContent = nextContent.split(oldText).join(newText);
+        nextTitle = nextTitle.split(oldText).join(newText);
+      } else {
+        const paras = [...paragraphs];
+        const targetPara = paras[paragraphIndex] || '';
+        let replacedPara = targetPara;
+
+        if (targetPara.slice(startInPara, startInPara + oldText.length) === oldText) {
+          replacedPara =
+            targetPara.slice(0, startInPara) + newText + targetPara.slice(startInPara + oldText.length);
+        } else {
+          const nearIdx = targetPara.indexOf(oldText, Math.max(0, startInPara - 10));
+          const fallbackIdx = nearIdx >= 0 ? nearIdx : targetPara.indexOf(oldText);
+          if (fallbackIdx >= 0) {
+            replacedPara =
+              targetPara.slice(0, fallbackIdx) + newText + targetPara.slice(fallbackIdx + oldText.length);
+          }
+        }
+        paras[paragraphIndex] = replacedPara;
+        nextContent = paras.join('\n\n');
+      }
+
+      await handleSaveTranslatedChapterContent(currentChapter.id, nextTitle, nextContent);
+      setSelectionTooltip(null);
+      window.getSelection()?.removeAllRanges();
+      showHUDToast(`Đã dùng: "${newText}"`);
+      return;
+    }
+
+    // Raw original mode (Chinese/non-translated): update chapter directly if non-CJK or save dictionary if CJK
+    if (containsCjk(oldText)) {
+      const existing = bookDictionaries.find((d) => d.original.trim() === oldText.trim());
+      const entry: DictionaryEntry = existing
+        ? { ...existing, replacement: newText, enabled: true }
+        : {
+            id: `dict-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+            bookId: book.id,
+            type: 'character',
+            original: oldText.trim(),
+            replacement: newText.trim(),
+            enabled: true,
+          };
+      await saveDictionaryEntry(entry);
+      const nextBookDict = await getDictionaries(book.id);
+      setBookDictionaries(nextBookDict);
+      if (!settings.applyDictionary) {
+        onUpdateSettings({ applyDictionary: true });
+      }
+      setSelectionTooltip(null);
+      window.getSelection()?.removeAllRanges();
+      showHUDToast(`Đã áp dụng name: "${newText}"`);
+    } else {
+      const nextContent =
+        scope === 'chapter'
+          ? currentChapter.content.split(oldText).join(newText)
+          : (() => {
+              const paras = [...paragraphs];
+              const p = paras[paragraphIndex] || '';
+              const idx = p.indexOf(oldText, Math.max(0, startInPara - 10));
+              const useIdx = idx >= 0 ? idx : p.indexOf(oldText);
+              if (useIdx >= 0) {
+                paras[paragraphIndex] = p.slice(0, useIdx) + newText + p.slice(useIdx + oldText.length);
+              }
+              return paras.join('\n\n');
+            })();
+      const nextTitle =
+        scope === 'chapter' ? currentChapter.title.split(oldText).join(newText) : currentChapter.title;
+      await handleSaveChapterContent(currentChapter.id, nextTitle, nextContent, `Sửa nhanh "${oldText}" -> "${newText}"`);
+      setSelectionTooltip(null);
+      window.getSelection()?.removeAllRanges();
+      showHUDToast(`Đã dùng: "${newText}"`);
+    }
+  };
+
+  const handleQuickSaveDictionary = async (params: {
+    originalZh: string;
+    oldDisplayedText: string;
+    replacement: string;
+    dictScope: QuickDictScope;
+    replaceScope: QuickReplaceScope;
+    paragraphIndex: number;
+    startInPara: number;
+    endInPara: number;
+  }) => {
+    const {
+      originalZh,
+      oldDisplayedText,
+      replacement,
+      dictScope,
+      replaceScope,
+      paragraphIndex,
+      startInPara,
+      endInPara,
+    } = params;
+    const targetBookId = dictScope === 'global' ? GLOBAL_DICTIONARY_BOOK_ID : book.id;
+    const scopeList = dictScope === 'global' ? globalDictionaries : bookDictionaries;
+    const keyOrig = (originalZh || oldDisplayedText).trim();
+    const existing = scopeList.find((d) => d.original.trim() === keyOrig);
+
+    const entry: DictionaryEntry = existing
+      ? { ...existing, replacement: replacement.trim(), enabled: true }
+      : {
+          id: `dict-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          bookId: targetBookId,
+          type: 'character',
+          original: keyOrig,
+          replacement: replacement.trim(),
+          enabled: true,
+        };
+
+    await saveDictionaryEntry(entry);
+    const [nextBookDict, nextGlobalDict] = await Promise.all([
+      getDictionaries(book.id),
+      getDictionaries(GLOBAL_DICTIONARY_BOOK_ID),
+    ]);
+    setBookDictionaries(nextBookDict);
+    setGlobalDictionaries(nextGlobalDict);
+
+    if (isViewingTranslation && currentTranslation) {
+      let nextContent = currentTranslation.translatedContent;
+      let nextTitle = currentTranslation.translatedTitle;
+      if (replaceScope === 'chapter') {
+        if (oldDisplayedText) {
+          nextContent = nextContent.split(oldDisplayedText).join(replacement);
+          nextTitle = nextTitle.split(oldDisplayedText).join(replacement);
+        }
+        if (keyOrig && keyOrig !== oldDisplayedText) {
+          nextContent = nextContent.split(keyOrig).join(replacement);
+          nextTitle = nextTitle.split(keyOrig).join(replacement);
+        }
+        await handleSaveTranslatedChapterContent(currentChapter.id, nextTitle, nextContent);
+      } else {
+        await applyNameReplacement({
+          oldText: oldDisplayedText,
+          newText: replacement,
+          scope: 'once',
+          paragraphIndex,
+          startInPara,
+          endInPara,
+        });
+      }
+    } else if (!settings.applyDictionary) {
+      onUpdateSettings({ applyDictionary: true });
+    }
+
+    setSelectionTooltip(null);
+    window.getSelection()?.removeAllRanges();
+    showHUDToast(`Đã lưu từ điển (${dictScope === 'global' ? 'Mọi truyện' : 'Truyện này'}): ${replacement}`);
+  };
+
+  // Inline Paragraph Operations (works on both original & translated text)
   const handleStartInlineEdit = (idx: number) => {
     const targetPara = paragraphs[idx] || '';
     setEditingParagraphIndex(idx);
+    setConfirmDeleteParaIdx(null);
     setParagraphEditText(targetPara);
+  };
+
+  const saveActiveParagraphsList = async (updatedParas: string[], summary: string) => {
+    const newContent = updatedParas.join('\n\n');
+    if (isViewingTranslation && currentTranslation) {
+      await handleSaveTranslatedChapterContent(
+        currentChapter.id,
+        currentTranslation.translatedTitle,
+        newContent
+      );
+    } else {
+      await handleSaveChapterContent(currentChapter.id, currentChapter.title, newContent, summary);
+    }
   };
 
   const handleSaveInlineParagraph = async (idx: number) => {
@@ -542,13 +865,14 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     } else {
       updatedParas.splice(idx, 1);
     }
-    const newContent = updatedParas.join('\n\n');
-    await handleSaveChapterContent(currentChapter.id, currentChapter.title, newContent, `Sửa đoạn ${idx + 1}`);
+    await saveActiveParagraphsList(updatedParas, `Sửa đoạn ${idx + 1}`);
     setEditingParagraphIndex(null);
+    setConfirmDeleteParaIdx(null);
   };
 
   const handleCancelInlineParagraph = () => {
     setEditingParagraphIndex(null);
+    setConfirmDeleteParaIdx(null);
     setParagraphEditText('');
   };
 
@@ -561,9 +885,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     const updatedParas = [...paragraphs];
     updatedParas[idx - 1] = `${updatedParas[idx - 1]} ${paragraphEditText.trim()}`;
     updatedParas.splice(idx, 1);
-    const newContent = updatedParas.join('\n\n');
-    await handleSaveChapterContent(currentChapter.id, currentChapter.title, newContent, `Gộp đoạn ${idx + 1} với đoạn trước`);
+    await saveActiveParagraphsList(updatedParas, `Gộp đoạn ${idx + 1} với đoạn trước`);
     setEditingParagraphIndex(null);
+    setConfirmDeleteParaIdx(null);
   };
 
   const handleMergeWithNextParagraph = async (idx: number) => {
@@ -571,18 +895,17 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     const updatedParas = [...paragraphs];
     updatedParas[idx] = `${paragraphEditText.trim()} ${updatedParas[idx + 1]}`;
     updatedParas.splice(idx + 1, 1);
-    const newContent = updatedParas.join('\n\n');
-    await handleSaveChapterContent(currentChapter.id, currentChapter.title, newContent, `Gộp đoạn ${idx + 1} với đoạn sau`);
+    await saveActiveParagraphsList(updatedParas, `Gộp đoạn ${idx + 1} với đoạn sau`);
     setEditingParagraphIndex(null);
+    setConfirmDeleteParaIdx(null);
   };
 
   const handleDeleteParagraph = async (idx: number) => {
-    if (!window.confirm('Bạn có chắc chắn muốn xóa đoạn văn này?')) return;
     const updatedParas = [...paragraphs];
     updatedParas.splice(idx, 1);
-    const newContent = updatedParas.join('\n\n');
-    await handleSaveChapterContent(currentChapter.id, currentChapter.title, newContent, `Xóa đoạn ${idx + 1}`);
+    await saveActiveParagraphsList(updatedParas, `Xóa đoạn ${idx + 1}`);
     setEditingParagraphIndex(null);
+    setConfirmDeleteParaIdx(null);
   };
 
   const handleHighlightSelection = async (color: Highlight['color']) => {
@@ -607,7 +930,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     const unsub = ttsService.subscribe((st) => setTtsState(st));
     // Auto advance chapter on TTS finish
     ttsService.setOnChapterFinished(() => {
-      if (settings.ttsAutoNextChapter && currentChapterIndex < chapters.length - 1) {
+      if (settings.ttsAutoNextChapter && currentChapterIndex < localChapters.length - 1) {
         handleGoToChapter(currentChapterIndex + 1);
         setTimeout(() => ttsService.play(0), 400);
       }
@@ -617,7 +940,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       unsub();
       ttsService.stop();
     };
-  }, [currentChapterIndex, chapters.length, settings.ttsAutoNextChapter]);
+  }, [currentChapterIndex, localChapters.length, settings.ttsAutoNextChapter]);
 
   // Load currently displayed text (original or translated) into TTS engine
   React.useEffect(() => {
@@ -634,12 +957,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           currentChapterIndex: chapterIdx,
           scrollProgress: progress,
           lastReadTimestamp: Date.now(),
-          status: chapterIdx === chapters.length - 1 && progress > 0.9 ? 'completed' : 'reading',
+          status: chapterIdx === localChapters.length - 1 && progress > 0.9 ? 'completed' : 'reading',
         };
         await saveBook(updatedBook);
       }, 500);
     },
-    [book, chapters.length]
+    [book, localChapters.length]
   );
 
   // Load saved translations for adjacent chapters in continuous mode
@@ -885,7 +1208,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
   // Chapter Navigation
   const handleGoToChapter = (newIndex: number) => {
-    if (newIndex >= 0 && newIndex < chapters.length) {
+    if (newIndex >= 0 && newIndex < localChapters.length) {
       skipContinuousResetRef.current = false;
       setCurrentChapterIndex(newIndex);
       setCurrentPageIndex(0);
@@ -898,6 +1221,61 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const paragraphs = React.useMemo(() => {
     return displayedContent.split('\n').filter((p) => p.trim().length > 0);
   }, [displayedContent]);
+
+  const jumpToSnippetInCurrentView = React.useCallback((snippet: string) => {
+    const cleanCore = snippet
+      .replace(/^\.\.\./, '')
+      .replace(/\.\.\.$/, '')
+      .trim()
+      .toLowerCase();
+    if (!cleanCore) return;
+
+    const probe = cleanCore.slice(0, Math.min(36, cleanCore.length));
+    const container = contentContainerRef.current;
+    if (!container) return;
+    const paraNodes = Array.from(container.querySelectorAll<HTMLElement>('[data-para-idx]'));
+    const matchedEl = paraNodes.find((el) =>
+      (el.textContent || '').toLowerCase().includes(probe)
+    );
+    if (!matchedEl) return;
+
+    const idxAttr = Number(matchedEl.getAttribute('data-para-idx'));
+    if (!Number.isNaN(idxAttr)) {
+      setFocusedParaIndex(idxAttr);
+    }
+
+    if (settings.readingMode === 'paginated' || settings.readingMode === 'two-column') {
+      const track = pagedTrackRef.current;
+      if (track && pagedBoxSize.width > 0) {
+        const effTwoCol = settings.readingMode === 'two-column' && pagedBoxSize.width >= 720;
+        const colGap = effTwoCol ? 56 : 48;
+        const stepW = pagedBoxSize.width + colGap;
+        const trackRect = track.getBoundingClientRect();
+        const elRect = matchedEl.getBoundingClientRect();
+        const relLeft = elRect.left - trackRect.left + currentPageIndex * stepW;
+        const targetPage = Math.max(0, Math.floor(relLeft / stepW));
+        setCurrentPageIndex(targetPage);
+      }
+    } else {
+      matchedEl.scrollIntoView({
+        block: 'center',
+        behavior: settings.smoothScroll === false ? 'auto' : 'smooth',
+      });
+    }
+  }, [settings.readingMode, settings.smoothScroll, pagedBoxSize.width, currentPageIndex]);
+
+  // Execute deferred jump to matched paragraph/page after Search, Bookmark, or Highlight selection
+  React.useEffect(() => {
+    const pending = pendingSearchJumpRef.current;
+    if (!pending || pending.chapterIndex !== currentChapterIndex) return;
+    pendingSearchJumpRef.current = null;
+
+    const raf = requestAnimationFrame(() => {
+      jumpToSnippetInCurrentView(pending.snippet);
+    });
+
+    return () => cancelAnimationFrame(raf);
+  }, [currentChapterIndex, paragraphs, jumpToSnippetInCurrentView]);
 
   // Global Keyboard Navigation & Shortcut System
   React.useEffect(() => {
@@ -920,6 +1298,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
       // Escape: Close open drawers or back to library
       if (e.key === 'Escape') {
+        if (pendingNoteModal) {
+          setPendingNoteModal(null);
+          return;
+        }
         if (showMoreMenu) {
           setShowMoreMenu(false);
           return;
@@ -936,7 +1318,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           showDictionary ||
           showTTS ||
           showThemeManager ||
-          showChapterManager
+          showChapterManager ||
+          showChapterEditor ||
+          showFindReplace ||
+          showVersions ||
+          showExport
         ) {
           setShowTOC(false);
           setShowSettings(false);
@@ -946,6 +1332,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           setShowTTS(false);
           setShowThemeManager(false);
           setShowChapterManager(false);
+          setShowChapterEditor(false);
+          setShowFindReplace(false);
+          setShowVersions(false);
+          setShowExport(false);
         } else {
           onBackToLibrary();
         }
@@ -955,9 +1345,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       // Next Chapter: ] or Shift + N
       if (e.key === ']' || (e.shiftKey && e.key.toLowerCase() === 'n')) {
         e.preventDefault();
-        if (currentChapterIndex < chapters.length - 1) {
+        if (currentChapterIndex < localChapters.length - 1) {
           handleGoToChapter(currentChapterIndex + 1);
-          showHUDToast(`Chương ${currentChapterIndex + 2} / ${chapters.length}`);
+          showHUDToast(`Chương ${currentChapterIndex + 2} / ${localChapters.length}`);
         } else {
           showHUDToast('Đã ở chương cuối');
         }
@@ -969,7 +1359,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         e.preventDefault();
         if (currentChapterIndex > 0) {
           handleGoToChapter(currentChapterIndex - 1);
-          showHUDToast(`Chương ${currentChapterIndex} / ${chapters.length}`);
+          showHUDToast(`Chương ${currentChapterIndex} / ${localChapters.length}`);
         } else {
           showHUDToast('Đã ở chương đầu');
         }
@@ -1049,8 +1439,25 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         return;
       }
 
+      // Find & Replace: Ctrl + H
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'h') {
+        e.preventDefault();
+        openFindReplaceModal();
+        return;
+      }
+
+      // Search: / or Ctrl + F
+      if (e.key === '/' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f')) {
+        e.preventDefault();
+        setShowSearch((prev) => !prev);
+        return;
+      }
+
+      // Guard remaining single-letter shortcuts against Ctrl/Meta browser/app combos
+      const hasModifier = e.ctrlKey || e.metaKey || e.altKey;
+
       // H: Toggle Toolbar / Zen mode
-      if (e.key === 'h' || e.key === 'H') {
+      if (!hasModifier && (e.key === 'h' || e.key === 'H')) {
         e.preventDefault();
         setShowUI((prev) => {
           const next = !prev;
@@ -1061,44 +1468,22 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       }
 
       // M: Table of Contents
-      if (e.key === 'm' || e.key === 'M') {
+      if (!hasModifier && (e.key === 'm' || e.key === 'M')) {
         e.preventDefault();
         setShowTOC((prev) => !prev);
         return;
       }
 
       // S: Settings drawer
-      if (e.key === 's' || e.key === 'S') {
+      if (!hasModifier && (e.key === 's' || e.key === 'S')) {
         e.preventDefault();
         setShowSettings((prev) => !prev);
         return;
       }
 
-      // Search: / or Ctrl + F
-      if (e.key === '/' || (e.ctrlKey && e.key.toLowerCase() === 'f')) {
+      // Edit Chapter / Translation: E
+      if (!hasModifier && (e.key === 'e' || e.key === 'E')) {
         e.preventDefault();
-        setShowSearch((prev) => !prev);
-        return;
-      }
-
-      // Find & Replace: Ctrl + H
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'h') {
-        e.preventDefault();
-        if (isViewingTranslation) {
-          showHUDToast('Chuyển về Nguyên văn để tìm & thay thế văn bản gốc');
-          return;
-        }
-        setShowFindReplace((prev) => !prev);
-        return;
-      }
-
-      // Edit Chapter: E
-      if (e.key === 'e' || e.key === 'E') {
-        e.preventDefault();
-        if (isViewingTranslation) {
-          showHUDToast('Chuyển về Nguyên văn để sửa chương gốc');
-          return;
-        }
         setShowChapterEditor((prev) => !prev);
         return;
       }
@@ -1153,9 +1538,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') {
         if (settings.readingMode === 'paginated' || settings.readingMode === 'two-column') {
           handleNextPage();
-        } else {
+        } else if (currentChapterIndex < localChapters.length - 1) {
           handleGoToChapter(currentChapterIndex + 1);
-          showHUDToast(`Chương ${currentChapterIndex + 2} / ${chapters.length}`);
+          showHUDToast(`Chương ${currentChapterIndex + 2} / ${localChapters.length}`);
+        } else {
+          showHUDToast('Đã ở chương cuối');
         }
         return;
       }
@@ -1164,9 +1551,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') {
         if (settings.readingMode === 'paginated' || settings.readingMode === 'two-column') {
           handlePrevPage();
-        } else {
+        } else if (currentChapterIndex > 0) {
           handleGoToChapter(currentChapterIndex - 1);
-          showHUDToast(`Chương ${currentChapterIndex} / ${chapters.length}`);
+          showHUDToast(`Chương ${currentChapterIndex} / ${localChapters.length}`);
+        } else {
+          showHUDToast('Đã ở chương đầu');
         }
         return;
       }
@@ -1264,7 +1653,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [
     currentChapterIndex,
-    chapters.length,
+    localChapters.length,
     totalPages,
     paragraphs.length,
     settings,
@@ -1276,8 +1665,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     showTTS,
     showThemeManager,
     showChapterManager,
+    showChapterEditor,
+    showFindReplace,
+    showVersions,
+    showExport,
     showShortcutHelp,
     showMoreMenu,
+    pendingNoteModal,
     ttsState,
     isViewingTranslation,
     cycleNextTheme,
@@ -1352,7 +1746,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       const next = currentPageIndex + 1;
       setCurrentPageIndex(next);
       saveReadingProgress(currentChapterIndex, totalPages > 1 ? next / (totalPages - 1) : 1);
-    } else if (currentChapterIndex < chapters.length - 1) {
+    } else if (currentChapterIndex < localChapters.length - 1) {
       handleGoToChapter(currentChapterIndex + 1);
     } else {
       showHUDToast('Đã ở trang cuối cùng');
@@ -1386,7 +1780,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     });
   };
 
-  // Text Selection Menu for Bookmarks / Dictionary / TTS
+  // Text Selection Menu / Quick Name Analyzer for Translated & Chinese Novels
   const handleMouseUp = () => {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed) {
@@ -1404,13 +1798,51 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           : range.startContainer.parentElement;
       const paraEl = startEl?.closest('[data-para-idx]');
       const paraIdxAttr = paraEl?.getAttribute('data-para-idx');
-      const paragraphIndex = paraIdxAttr !== null && paraIdxAttr !== undefined ? Number(paraIdxAttr) : undefined;
+      const parsedIdx = paraIdxAttr !== null && paraIdxAttr !== undefined ? Number(paraIdxAttr) : undefined;
+      const paragraphIndex = parsedIdx !== undefined && !Number.isNaN(parsedIdx) ? parsedIdx : undefined;
+
+      let startInPara: number | undefined;
+      let endInPara: number | undefined;
+      if (paragraphIndex !== undefined && paraEl) {
+        const paraRaw = paragraphs[paragraphIndex] || '';
+        try {
+          const preRange = range.cloneRange();
+          preRange.selectNodeContents(paraEl);
+          preRange.setEnd(range.startContainer, range.startOffset);
+          const rawStart = preRange.toString().length;
+          if (paraRaw.slice(rawStart, rawStart + text.length) === text) {
+            startInPara = rawStart;
+            endInPara = rawStart + text.length;
+          } else {
+            const near = paraRaw.indexOf(text, Math.max(0, rawStart - 12));
+            const fallback = near >= 0 ? near : paraRaw.indexOf(text);
+            if (fallback >= 0) {
+              startInPara = fallback;
+              endInPara = fallback + text.length;
+            }
+          }
+        } catch {
+          const idx = paraRaw.indexOf(text);
+          if (idx >= 0) {
+            startInPara = idx;
+            endInPara = idx + text.length;
+          }
+        }
+      }
+
+      const preferQuickName =
+        isViewingTranslation ||
+        containsCjk(text) ||
+        containsCjk(currentChapter.content);
 
       setSelectionTooltip({
         x: rect.left + rect.width / 2,
         y: rect.top - 10,
         text,
-        paragraphIndex: Number.isNaN(paragraphIndex) ? undefined : paragraphIndex,
+        paragraphIndex,
+        startInPara,
+        endInPara,
+        mode: preferQuickName ? 'quick-name' : 'menu',
       });
     } else {
       setSelectionTooltip(null);
@@ -1439,7 +1871,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       bookId: book.id,
       chapterIndex: currentChapterIndex,
       chapterTitle: currentChapter.title,
-      progressPercent: Math.round(((currentChapterIndex + 1) / chapters.length) * 100),
+      progressPercent: Math.round(((currentChapterIndex + 1) / Math.max(1, localChapters.length)) * 100),
       textSnippet,
       note: noteText || undefined,
       createdAt: Date.now(),
@@ -1459,16 +1891,20 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     full: 'max-w-5xl', // ~1024px
   }[settings.containerWidth] || 'max-w-2xl';
 
-  // Apply dictionary replacements cleanly and escape HTML before dangerouslySetInnerHTML
+  const currentChapterHighlights = React.useMemo(
+    () => highlights.filter((h) => h.chapterIndex === currentChapterIndex),
+    [highlights, currentChapterIndex]
+  );
+
+  // Apply dictionary replacements cleanly, escape HTML, and overlay highlights
   const processedParagraphs = React.useMemo(() => {
-    if (isViewingTranslation) {
-      return paragraphs.map((para) => escapeHtml(para));
-    }
     return paragraphs.map((para) => {
-      if (settings.applyDictionary && dictionaries.length > 0) {
-        return applyDictionaryToText(para, dictionaries, settings.highlightReplacements);
-      }
-      return escapeHtml(para);
+      const baseHtml = isViewingTranslation
+        ? escapeHtml(para)
+        : settings.applyDictionary && dictionaries.length > 0
+        ? applyDictionaryToText(para, dictionaries, settings.highlightReplacements)
+        : escapeHtml(para);
+      return applyHighlightsToHtml(baseHtml, currentChapterHighlights);
     });
   }, [
     isViewingTranslation,
@@ -1476,6 +1912,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     settings.applyDictionary,
     settings.highlightReplacements,
     dictionaries,
+    currentChapterHighlights,
   ]);
 
   const visibleParagraphs = processedParagraphs;
@@ -1484,8 +1921,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     100,
     Math.max(
       0,
-      chapters.length > 0
-        ? Math.round(((currentChapterIndex + 1) / chapters.length) * 100)
+      localChapters.length > 0
+        ? Math.round(((currentChapterIndex + 1) / localChapters.length) * 100)
         : 0
     )
   );
@@ -1554,10 +1991,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
             {/* Compact Reading Progress */}
             <div
               className="hidden sm:flex items-center gap-2 px-2.5 py-1 rounded-lg bg-black/15 dark:bg-white/5 border border-black/10 dark:border-white/10 text-[11px] font-mono"
-              title={`Tiến trình đọc: Chương ${currentChapterIndex + 1} / ${chapters.length} (${currentOverallPercent}%)`}
+              title={`Tiến trình đọc: Chương ${currentChapterIndex + 1} / ${localChapters.length} (${currentOverallPercent}%)`}
             >
               <span className="opacity-75">
-                Ch. {currentChapterIndex + 1}/{chapters.length}
+                Ch. {currentChapterIndex + 1}/{localChapters.length}
               </span>
               <span className="opacity-30">•</span>
               <span className="font-semibold text-amber-500">{currentOverallPercent}%</span>
@@ -1586,7 +2023,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               </button>
 
               <button
-                disabled={currentChapterIndex >= chapters.length - 1}
+                disabled={currentChapterIndex >= localChapters.length - 1}
                 onClick={() => handleGoToChapter(currentChapterIndex + 1)}
                 className="p-1.5 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors cursor-pointer"
                 title="Chương sau (→)"
@@ -1904,44 +2341,30 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                     type="button"
                     onClick={() => {
                       setShowMoreMenu(false);
-                      if (isViewingTranslation) {
-                        showHUDToast('Chuyển về Nguyên văn để sửa chương gốc');
-                        return;
-                      }
                       setShowChapterEditor(true);
                     }}
-                    disabled={isViewingTranslation}
-                    className="w-full flex items-center justify-between px-3 py-2 hover:bg-neutral-800 disabled:opacity-40 disabled:cursor-not-allowed text-left transition-colors cursor-pointer"
+                    className="w-full flex items-center justify-between px-3 py-2 hover:bg-neutral-800 text-left transition-colors cursor-pointer"
                   >
                     <span className="flex items-center space-x-2">
                       <Edit3 className="w-3.5 h-3.5 text-amber-400" />
-                      <span>Chỉnh sửa chương</span>
+                      <span>{isViewingTranslation ? 'Chỉnh sửa bản dịch' : 'Chỉnh sửa chương'}</span>
                     </span>
-                    <kbd className="text-[10px] font-mono text-neutral-500">
-                      {isViewingTranslation ? 'Khóa' : 'E'}
-                    </kbd>
+                    <kbd className="text-[10px] font-mono text-neutral-500">E</kbd>
                   </button>
 
                   <button
                     type="button"
                     onClick={() => {
                       setShowMoreMenu(false);
-                      if (isViewingTranslation) {
-                        showHUDToast('Chuyển về Nguyên văn để thay thế văn bản gốc');
-                        return;
-                      }
-                      setShowFindReplace(true);
+                      openFindReplaceModal();
                     }}
-                    disabled={isViewingTranslation}
-                    className="w-full flex items-center justify-between px-3 py-2 hover:bg-neutral-800 disabled:opacity-40 disabled:cursor-not-allowed text-left transition-colors cursor-pointer"
+                    className="w-full flex items-center justify-between px-3 py-2 hover:bg-neutral-800 text-left transition-colors cursor-pointer"
                   >
                     <span className="flex items-center space-x-2">
                       <Replace className="w-3.5 h-3.5 text-neutral-400" />
-                      <span>Tìm & Thay thế</span>
+                      <span>{isViewingTranslation ? 'Tìm & Thay thế (Bản dịch)' : 'Tìm & Thay thế'}</span>
                     </span>
-                    <kbd className="text-[10px] font-mono text-neutral-500">
-                      {isViewingTranslation ? 'Khóa' : 'Ctrl+H'}
-                    </kbd>
+                    <kbd className="text-[10px] font-mono text-neutral-500">Ctrl+H</kbd>
                   </button>
 
                   <button
@@ -2158,19 +2581,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   </span>
                   <div className="flex items-center justify-center space-x-2">
                     <h1 className="text-2xl font-bold tracking-tight">{displayedTitle}</h1>
-                    {!isViewingTranslation && (
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setShowChapterEditor(true);
-                        }}
-                        className="opacity-0 group-hover:opacity-100 p-1.5 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 text-neutral-400 hover:text-amber-500 transition-all cursor-pointer"
-                        title="Chỉnh sửa tiêu đề hoặc nội dung chương (E)"
-                      >
-                        <Edit3 className="w-4 h-4" />
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowChapterEditor(true);
+                      }}
+                      className="opacity-0 group-hover:opacity-100 p-1.5 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 text-neutral-400 hover:text-amber-500 transition-all cursor-pointer"
+                      title={
+                        isViewingTranslation
+                          ? 'Chỉnh sửa tiêu đề hoặc nội dung bản dịch (E)'
+                          : 'Chỉnh sửa tiêu đề hoặc nội dung chương (E)'
+                      }
+                    >
+                      <Edit3 className="w-4 h-4" />
+                    </button>
                   </div>
 
                   {(currentTranslation || isTranslating || translationError) && (
@@ -2324,7 +2749,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               </div>
 
               <button
-                disabled={currentPageIndex >= totalPages - 1 && currentChapterIndex >= chapters.length - 1}
+                disabled={currentPageIndex >= totalPages - 1 && currentChapterIndex >= localChapters.length - 1}
                 onClick={handleNextPage}
                 className="flex items-center space-x-1 px-3 py-1.5 rounded-lg border border-black/20 dark:border-white/20 disabled:opacity-30 hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer"
               >
@@ -2373,12 +2798,14 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               const chTitle = chViewingTrans ? chTranslation!.translatedTitle : ch.title;
               const chContent = chViewingTrans ? chTranslation!.translatedContent : ch.content;
               const chParas = chContent.split('\n').filter((p) => p.trim().length > 0);
+              const chHighlights = highlights.filter((h) => h.chapterIndex === chIdx);
               const chRenderedParas = chParas.map((para) => {
-                if (chViewingTrans) return escapeHtml(para);
-                if (settings.applyDictionary && dictionaries.length > 0) {
-                  return applyDictionaryToText(para, dictionaries, settings.highlightReplacements);
-                }
-                return escapeHtml(para);
+                const baseHtml = chViewingTrans
+                  ? escapeHtml(para)
+                  : settings.applyDictionary && dictionaries.length > 0
+                  ? applyDictionaryToText(para, dictionaries, settings.highlightReplacements)
+                  : escapeHtml(para);
+                return applyHighlightsToHtml(baseHtml, chHighlights);
               });
 
               return (
@@ -2393,7 +2820,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                     </span>
                     <div className="flex items-center justify-center space-x-2">
                       <h2 className="text-2xl font-bold tracking-tight">{chTitle}</h2>
-                      {isActiveChapter && !isViewingTranslation && (
+                      {isActiveChapter && (
                         <button
                           type="button"
                           onClick={(e) => {
@@ -2401,7 +2828,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                             setShowChapterEditor(true);
                           }}
                           className="opacity-0 group-hover:opacity-100 p-1.5 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 text-neutral-400 hover:text-amber-500 transition-all cursor-pointer"
-                          title="Chỉnh sửa tiêu đề hoặc nội dung chương (E)"
+                          title={
+                            isViewingTranslation
+                              ? 'Chỉnh sửa tiêu đề hoặc nội dung bản dịch (E)'
+                              : 'Chỉnh sửa tiêu đề hoặc nội dung chương (E)'
+                          }
                         >
                           <Edit3 className="w-4 h-4" />
                         </button>
@@ -2548,19 +2979,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 <h1 className="text-2xl font-bold tracking-tight">
                   {displayedTitle}
                 </h1>
-                {!isViewingTranslation && (
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setShowChapterEditor(true);
-                    }}
-                    className="opacity-0 group-hover:opacity-100 p-1.5 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 text-neutral-400 hover:text-amber-500 transition-all cursor-pointer"
-                    title="Chỉnh sửa tiêu đề hoặc nội dung chương (E)"
-                  >
-                    <Edit3 className="w-4 h-4" />
-                  </button>
-                )}
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setShowChapterEditor(true);
+                  }}
+                  className="opacity-0 group-hover:opacity-100 p-1.5 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 text-neutral-400 hover:text-amber-500 transition-all cursor-pointer"
+                  title={
+                    isViewingTranslation
+                      ? 'Chỉnh sửa tiêu đề hoặc nội dung bản dịch (E)'
+                      : 'Chỉnh sửa tiêu đề hoặc nội dung chương (E)'
+                  }
+                >
+                  <Edit3 className="w-4 h-4" />
+                </button>
               </div>
 
               {settings.readingMode === 'focus' && paragraphs.length > 0 && (
@@ -2646,8 +3079,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
                   {isViewingTranslation && !isTranslating && (
                     <div className="inline-flex items-center space-x-1 text-[11px] opacity-70">
-                      <Lock className="w-3 h-3" />
-                      <span>Đang xem bản dịch</span>
+                      <span>Bôi đen cụm từ để chỉnh Name (Trung / Việt / Hán Việt / Eng) hoặc bấm Sửa</span>
                     </div>
                   )}
 
@@ -2767,14 +3199,34 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                               Gộp đoạn sau
                             </button>
                           )}
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteParagraph(actualParaIdx)}
-                            className="px-2 py-1 rounded bg-red-950/60 border border-red-800/40 hover:bg-red-900/60 text-red-300 text-[11px] cursor-pointer"
-                            title="Xóa đoạn này"
-                          >
-                            Xóa đoạn
-                          </button>
+                          {confirmDeleteParaIdx === actualParaIdx ? (
+                            <div className="flex items-center space-x-1 bg-red-950/80 border border-red-700/60 rounded px-1.5 py-0.5">
+                              <span className="text-[10px] text-red-200">Xóa?</span>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteParagraph(actualParaIdx)}
+                                className="px-1.5 py-0.5 rounded bg-red-600 hover:bg-red-500 text-white text-[10px] font-semibold cursor-pointer"
+                              >
+                                Xác nhận
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteParaIdx(null)}
+                                className="px-1.5 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-[10px] cursor-pointer"
+                              >
+                                Hủy
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteParaIdx(actualParaIdx)}
+                              className="px-2 py-1 rounded bg-red-950/60 border border-red-800/40 hover:bg-red-900/60 text-red-300 text-[11px] cursor-pointer"
+                              title="Xóa đoạn này"
+                            >
+                              Xóa đoạn
+                            </button>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -2825,11 +3277,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               </button>
 
               <span className="text-xs opacity-60 font-mono">
-                {currentChapterIndex + 1} / {chapters.length}
+                {currentChapterIndex + 1} / {localChapters.length}
               </span>
 
               <button
-                disabled={currentChapterIndex >= chapters.length - 1}
+                disabled={currentChapterIndex >= localChapters.length - 1}
                 onClick={(e) => {
                   e.stopPropagation();
                   handleGoToChapter(currentChapterIndex + 1);
@@ -2909,71 +3361,219 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         </div>
       )}
 
-      {/* Floating Text Selection Mini Action Menu */}
-      <SelectionActionMenu
-        position={selectionTooltip}
-        selectedText={selectionTooltip?.text || ''}
-        disableEditActions={isViewingTranslation}
-        onEdit={() => {
-          if (isViewingTranslation) {
-            showHUDToast('Chuyển về Nguyên văn để sửa chương gốc');
-            setSelectionTooltip(null);
-            return;
+      {/* Floating Quick Name & Manual Translation Editor Popup */}
+      {selectionTooltip?.mode === 'quick-name' && (
+        <QuickNameEditModal
+          position={selectionTooltip}
+          selectedText={selectionTooltip.text}
+          paragraphIndex={selectionTooltip.paragraphIndex ?? 0}
+          displayedParagraph={
+            selectionTooltip.paragraphIndex !== undefined
+              ? paragraphs[selectionTooltip.paragraphIndex] || selectionTooltip.text
+              : selectionTooltip.text
           }
-          if (selectionTooltip?.paragraphIndex !== undefined) {
-            handleStartInlineEdit(selectionTooltip.paragraphIndex);
-          } else {
-            setShowChapterEditor(true);
-          }
-          setSelectionTooltip(null);
-          window.getSelection()?.removeAllRanges();
-        }}
-        onCopy={() => {
-          if (selectionTooltip) {
-            navigator.clipboard.writeText(selectionTooltip.text).catch(() => {});
-            showHUDToast('Đã sao chép vào bộ nhớ tạm');
-          }
-        }}
-        onHighlight={handleHighlightSelection}
-        onAddNote={() => {
-          if (selectionTooltip) {
-            const noteText = window.prompt('Nhập ghi chú cho đoạn này:');
-            if (noteText) {
-              handleAddBookmark(noteText, selectionTooltip.text);
-              showHUDToast('Đã thêm ghi chú');
+          sourceParagraph={(() => {
+            if (selectionTooltip.paragraphIndex === undefined) {
+              return currentChapter.content;
             }
-            setSelectionTooltip(null);
+            const srcRaw = (currentTranslation?.sourceContent || currentChapter.content || '')
+              .split('\n')
+              .filter((p) => p.trim().length > 0);
+            return srcRaw[selectionTooltip.paragraphIndex] || currentChapter.content;
+          })()}
+          selectionStartInPara={selectionTooltip.startInPara ?? 0}
+          selectionEndInPara={
+            selectionTooltip.endInPara ?? selectionTooltip.text.length
           }
-        }}
-        onAddToDictionary={() => {
-          if (selectionTooltip) {
+          isViewingTranslation={isViewingTranslation}
+          dictionaries={dictionaries}
+          onUpdateSelection={(next) => {
+            setSelectionTooltip((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    text: next.text,
+                    startInPara: next.startInPara,
+                    endInPara: next.endInPara,
+                  }
+                : null
+            );
+          }}
+          onApplyValue={applyNameReplacement}
+          onSaveDictionary={handleQuickSaveDictionary}
+          onOpenDictionaryManager={() => {
             setSelectedTextForDict(selectionTooltip.text);
             setShowDictionary(true);
             setSelectionTooltip(null);
-          }
-        }}
-        onSearch={() => {
-          if (selectionTooltip) {
+          }}
+          onOpenInlineParagraphEdit={() => {
+            if (selectionTooltip.paragraphIndex !== undefined) {
+              handleStartInlineEdit(selectionTooltip.paragraphIndex);
+            } else {
+              setShowChapterEditor(true);
+            }
+            setSelectionTooltip(null);
+            window.getSelection()?.removeAllRanges();
+          }}
+          onSearchInBook={(q) => {
+            setSearchInitialQuery(q);
             setShowSearch(true);
             setSelectionTooltip(null);
-          }
-        }}
-        onReplace={() => {
-          if (selectionTooltip) {
-            setFindReplaceInitialText(selectionTooltip.text);
-            setShowFindReplace(true);
+          }}
+          onSpeakPhrase={(phrase) => {
+            if ('speechSynthesis' in window) {
+              window.speechSynthesis.cancel();
+              const utt = new SpeechSynthesisUtterance(phrase);
+              utt.rate = settings.ttsRate || 1;
+              utt.pitch = settings.ttsPitch || 1;
+              window.speechSynthesis.speak(utt);
+            }
+          }}
+          onHighlight={async (color, text) => {
+            const newHighlight: Highlight = {
+              id: `hl-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+              bookId: book.id,
+              chapterIndex: currentChapterIndex,
+              text,
+              color,
+              createdAt: Date.now(),
+            };
+            await saveHighlight(newHighlight);
+            const updated = await getHighlights(book.id);
+            setHighlights(updated);
+            showHUDToast('Đã tô sáng đoạn văn');
             setSelectionTooltip(null);
+          }}
+          onAddNote={(text) => {
+            setPendingNoteModal({ text, note: '' });
+            setSelectionTooltip(null);
+          }}
+          onClose={() => setSelectionTooltip(null)}
+        />
+      )}
+
+      {/* Floating Text Selection Mini Action Menu */}
+      {selectionTooltip?.mode === 'menu' && (
+        <SelectionActionMenu
+          position={selectionTooltip}
+          selectedText={selectionTooltip.text}
+          disableEditActions={false}
+          onOpenQuickName={() =>
+            setSelectionTooltip((prev) => (prev ? { ...prev, mode: 'quick-name' } : null))
           }
-        }}
-        onBookmark={() => {
-          if (selectionTooltip) {
+          onEdit={() => {
+            if (selectionTooltip.paragraphIndex !== undefined) {
+              handleStartInlineEdit(selectionTooltip.paragraphIndex);
+            } else {
+              setShowChapterEditor(true);
+            }
+            setSelectionTooltip(null);
+            window.getSelection()?.removeAllRanges();
+          }}
+          onCopy={() => {
+            navigator.clipboard.writeText(selectionTooltip.text).catch(() => {});
+            showHUDToast('Đã sao chép vào bộ nhớ tạm');
+          }}
+          onHighlight={handleHighlightSelection}
+          onAddNote={() => {
+            setPendingNoteModal({ text: selectionTooltip.text, note: '' });
+            setSelectionTooltip(null);
+          }}
+          onAddToDictionary={() => {
+            setSelectedTextForDict(selectionTooltip.text);
+            setShowDictionary(true);
+            setSelectionTooltip(null);
+          }}
+          onSearch={() => {
+            setSearchInitialQuery(selectionTooltip.text);
+            setShowSearch(true);
+            setSelectionTooltip(null);
+          }}
+          onReplace={() => {
+            setFindReplaceInitialText(selectionTooltip.text);
+            openFindReplaceModal();
+            setSelectionTooltip(null);
+          }}
+          onBookmark={() => {
             handleAddBookmark(undefined, selectionTooltip.text);
             showHUDToast('Đã đánh dấu đoạn văn');
             setSelectionTooltip(null);
-          }
-        }}
-        onClose={() => setSelectionTooltip(null)}
-      />
+          }}
+          onClose={() => setSelectionTooltip(null)}
+        />
+      )}
+
+      {/* In-App Add Note Dialog (iframe & desktop safe) */}
+      {pendingNoteModal && (
+        <div
+          className="fixed inset-0 z-[70] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setPendingNoteModal(null)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-neutral-900 border border-neutral-700 rounded-2xl w-full max-w-md shadow-2xl overflow-hidden text-xs text-neutral-200 select-none"
+          >
+            <div className="px-4 py-3 border-b border-neutral-800 bg-neutral-950 flex items-center justify-between">
+              <div className="flex items-center space-x-2 font-semibold text-neutral-100">
+                <FileText className="w-4 h-4 text-amber-400" />
+                <span>Thêm ghi chú cho đoạn văn</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPendingNoteModal(null)}
+                className="p-1 text-neutral-400 hover:text-white rounded-lg hover:bg-neutral-800 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-4 space-y-3">
+              <blockquote className="p-2.5 rounded-lg bg-neutral-950 border-l-2 border-amber-500/60 text-neutral-300 italic font-serif line-clamp-3">
+                "{pendingNoteModal.text}"
+              </blockquote>
+              <textarea
+                rows={3}
+                value={pendingNoteModal.note}
+                onChange={(e) =>
+                  setPendingNoteModal((prev) => (prev ? { ...prev, note: e.target.value } : null))
+                }
+                onKeyDown={(e) => {
+                  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && pendingNoteModal.note.trim()) {
+                    e.preventDefault();
+                    handleAddBookmark(pendingNoteModal.note.trim(), pendingNoteModal.text);
+                    setPendingNoteModal(null);
+                    showHUDToast('Đã thêm ghi chú');
+                  }
+                }}
+                placeholder="Nhập ghi chú..."
+                className="w-full px-3 py-2 bg-neutral-950 border border-neutral-800 rounded-lg text-xs text-neutral-100 focus:outline-none focus:border-amber-500"
+                autoFocus
+              />
+            </div>
+            <div className="px-4 py-3 border-t border-neutral-800 bg-neutral-950 flex items-center justify-end space-x-2">
+              <button
+                type="button"
+                onClick={() => setPendingNoteModal(null)}
+                className="px-3.5 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 cursor-pointer"
+              >
+                Hủy
+              </button>
+              <button
+                type="button"
+                disabled={!pendingNoteModal.note.trim()}
+                onClick={() => {
+                  if (!pendingNoteModal.note.trim()) return;
+                  handleAddBookmark(pendingNoteModal.note.trim(), pendingNoteModal.text);
+                  setPendingNoteModal(null);
+                  showHUDToast('Đã thêm ghi chú');
+                }}
+                className="px-4 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white font-semibold cursor-pointer"
+              >
+                Lưu ghi chú
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Bottom Floating Navigation HUD */}
       {showUI && (
@@ -2993,12 +3593,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           {/* Chapter slider & stats */}
           <div className="flex-1 max-w-md mx-6 flex items-center space-x-3">
             <span className="text-[11px] font-mono opacity-60 shrink-0">
-              {currentChapterIndex + 1}/{chapters.length}
+              {currentChapterIndex + 1}/{localChapters.length}
             </span>
             <input
               type="range"
               min={0}
-              max={Math.max(0, chapters.length - 1)}
+              max={Math.max(0, localChapters.length - 1)}
               value={currentChapterIndex}
               onChange={(e) => handleGoToChapter(Number(e.target.value))}
               className="flex-1 accent-amber-500 cursor-pointer h-1.5"
@@ -3009,7 +3609,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           </div>
 
           <button
-            disabled={currentChapterIndex >= chapters.length - 1}
+            disabled={currentChapterIndex >= localChapters.length - 1}
             onClick={() => handleGoToChapter(currentChapterIndex + 1)}
             className="flex items-center space-x-1 text-xs font-medium disabled:opacity-30 hover:text-amber-400 transition-colors cursor-pointer"
           >
@@ -3030,7 +3630,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       <ReaderTOC
         isOpen={showTOC}
         onClose={() => setShowTOC(false)}
-        chapters={chapters}
+        chapters={localChapters}
         currentChapterIndex={currentChapterIndex}
         onSelectChapter={handleGoToChapter}
         onOpenChapterManager={() => setShowChapterManager(true)}
@@ -3046,11 +3646,32 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
       <ReaderSearch
         isOpen={showSearch}
-        onClose={() => setShowSearch(false)}
-        chapters={chapters}
+        onClose={() => {
+          setShowSearch(false);
+          setSearchInitialQuery('');
+        }}
+        chapters={
+          isViewingTranslation && currentTranslation
+            ? localChapters.map((ch) =>
+                ch.id === currentChapter.id
+                  ? {
+                      ...ch,
+                      title: currentTranslation.translatedTitle,
+                      content: currentTranslation.translatedContent,
+                    }
+                  : ch
+              )
+            : localChapters
+        }
         currentChapterIndex={currentChapterIndex}
-        onJumpToResult={(chIdx) => {
-          handleGoToChapter(chIdx);
+        initialQuery={searchInitialQuery}
+        onJumpToResult={(chIdx, snippet) => {
+          if (chIdx !== currentChapterIndex) {
+            pendingSearchJumpRef.current = { chapterIndex: chIdx, snippet };
+            handleGoToChapter(chIdx);
+          } else {
+            jumpToSnippetInCurrentView(snippet);
+          }
         }}
       />
 
@@ -3058,12 +3679,34 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         isOpen={showBookmarks}
         onClose={() => setShowBookmarks(false)}
         bookmarks={bookmarks}
+        highlights={highlights}
         onSelectBookmark={(bm) => {
-          handleGoToChapter(bm.chapterIndex);
+          if (bm.chapterIndex !== currentChapterIndex) {
+            pendingSearchJumpRef.current = { chapterIndex: bm.chapterIndex, snippet: bm.textSnippet };
+            handleGoToChapter(bm.chapterIndex);
+          } else {
+            jumpToSnippetInCurrentView(bm.textSnippet);
+          }
         }}
         onDeleteBookmark={async (bmId) => {
+          await deleteBookmark(bmId);
           const updated = bookmarks.filter((b) => b.id !== bmId);
           setBookmarks(updated);
+          showHUDToast('Đã xóa dấu trang');
+        }}
+        onSelectHighlight={(hl) => {
+          if (hl.chapterIndex !== currentChapterIndex) {
+            pendingSearchJumpRef.current = { chapterIndex: hl.chapterIndex, snippet: hl.text };
+            handleGoToChapter(hl.chapterIndex);
+          } else {
+            jumpToSnippetInCurrentView(hl.text);
+          }
+        }}
+        onDeleteHighlight={async (hlId) => {
+          await deleteHighlight(hlId);
+          const updated = highlights.filter((h) => h.id !== hlId);
+          setHighlights(updated);
+          showHUDToast('Đã xóa tô sáng');
         }}
         onAddBookmarkCurrent={() => handleAddBookmark()}
       />
@@ -3099,8 +3742,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         isOpen={showChapterManager}
         onClose={() => setShowChapterManager(false)}
         book={book}
-        chapters={chapters}
+        chapters={localChapters}
         onChaptersUpdated={(updatedChapters, updatedBook) => {
+          setLocalChapters(updatedChapters);
           if (onChaptersUpdated) {
             onChaptersUpdated(updatedChapters, updatedBook);
           }
@@ -3113,12 +3757,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         onClose={() => setShowShortcutHelp(false)}
       />
 
-      {/* Chapter Direct Editor Modal */}
+      {/* Chapter Direct Editor Modal (supports both Original and Translated views) */}
       <ChapterEditorModal
         isOpen={showChapterEditor}
         onClose={() => setShowChapterEditor(false)}
         chapter={currentChapter}
-        onSaveChapter={handleSaveChapterContent}
+        isTranslationMode={isViewingTranslation}
+        titleOverride={isViewingTranslation ? currentTranslation?.translatedTitle : undefined}
+        contentOverride={isViewingTranslation ? currentTranslation?.translatedContent : undefined}
+        onSaveChapter={async (chId, updatedTitle, updatedContent, summary) => {
+          if (isViewingTranslation && currentTranslation) {
+            await handleSaveTranslatedChapterContent(chId, updatedTitle, updatedContent);
+          } else {
+            await handleSaveChapterContent(chId, updatedTitle, updatedContent, summary);
+          }
+        }}
         onOpenVersions={() => {
           setShowChapterEditor(false);
           setShowVersions(true);
@@ -3126,20 +3779,58 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         onRestoreOriginal={handleRestoreOriginalChapter}
       />
 
-      {/* Advanced Find & Replace Modal */}
+      {/* Advanced Find & Replace Modal (supports both Original and Translated views) */}
       <ReaderFindReplaceModal
         isOpen={showFindReplace}
         onClose={() => {
           setShowFindReplace(false);
           setFindReplaceInitialText('');
+          setTranslatedChaptersForReplace(null);
         }}
-        currentChapter={currentChapter}
-        chapters={localChapters}
+        currentChapter={
+          isViewingTranslation && currentTranslation
+            ? {
+                ...currentChapter,
+                title: currentTranslation.translatedTitle,
+                content: currentTranslation.translatedContent,
+              }
+            : currentChapter
+        }
+        chapters={
+          isViewingTranslation
+            ? translatedChaptersForReplace ||
+              (currentTranslation
+                ? [
+                    {
+                      ...currentChapter,
+                      title: currentTranslation.translatedTitle,
+                      content: currentTranslation.translatedContent,
+                    },
+                  ]
+                : [])
+            : localChapters
+        }
+        isTranslationMode={isViewingTranslation}
         initialSearchText={findReplaceInitialText}
         onUpdateChapterContent={async (chId, content, summary) => {
-          await handleSaveChapterContent(chId, currentChapter.title, content, summary);
+          if (isViewingTranslation) {
+            const targetTitle =
+              (chId === currentChapter.id ? currentTranslation?.translatedTitle : undefined) ||
+              translatedChaptersForReplace?.find((c) => c.id === chId)?.title ||
+              currentChapter.title;
+            await handleSaveTranslatedChapterContent(chId, targetTitle, content);
+          } else {
+            const chTitle = localChapters.find((c) => c.id === chId)?.title || currentChapter.title;
+            await handleSaveChapterContent(chId, chTitle, content, summary);
+          }
         }}
-        onBatchUpdateChapters={handleBatchUpdateChapters}
+        onBatchUpdateChapters={async (updatedChapters, summary) => {
+          if (isViewingTranslation) {
+            await handleBatchUpdateTranslatedChapters(updatedChapters);
+          } else {
+            await handleBatchUpdateChapters(updatedChapters, summary);
+          }
+        }}
       />
 
       {/* Chapter Version History & Diff Modal */}

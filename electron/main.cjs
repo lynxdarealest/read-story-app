@@ -46,7 +46,12 @@ function extractBaseDomain(urlOrHost) {
 }
 
 function assertPublicHttpUrl(rawUrl) {
-  const parsed = new URL(String(rawUrl || '').trim());
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl || '').trim());
+  } catch {
+    throw new Error('URL không hợp lệ. Vui lòng nhập đầy đủ http:// hoặc https://');
+  }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error('Chỉ hỗ trợ giao thức HTTP và HTTPS.');
   }
@@ -782,6 +787,64 @@ function setupIpcHandlers() {
     if (!upstreamRes.ok) throw new Error(`Dịch vụ dịch trả về lỗi HTTP ${upstreamRes.status}.`);
     if (!rawText || !rawText.trim()) throw new Error('Dịch vụ dịch trả về phản hồi rỗng.');
     return rawText;
+  });
+
+  ipcMain.handle('desktop:analyzePhrase', async (_e, phrase) => {
+    const rawPhrase = typeof phrase === 'string' ? phrase.trim() : '';
+    if (!rawPhrase || rawPhrase.length > 160) return {};
+
+    const fetchGtx = async (tl) => {
+      try {
+        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=zh-CN&tl=${tl}&dt=t&q=${encodeURIComponent(rawPhrase)}`;
+        const r = await fetch(url, {
+          headers: { 'User-Agent': DEFAULT_USER_AGENT },
+          signal: AbortSignal.timeout(4500),
+        });
+        if (!r.ok) return undefined;
+        const text = await r.text();
+        if (!text.trim().startsWith('[')) return undefined;
+        const data = JSON.parse(text);
+        if (Array.isArray(data?.[0])) {
+          const joined = data[0].map((part) => (Array.isArray(part) ? part[0] || '' : '')).join('').trim();
+          return joined || undefined;
+        }
+      } catch {
+        return undefined;
+      }
+      return undefined;
+    };
+
+    const fetchStvVi = async () => {
+      try {
+        const body = new URLSearchParams({ sajax: 'trans', content: rawPhrase }).toString();
+        const r = await fetch('https://comic.sangtacvietcdn.xyz/tsm.php?cdn=/', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'User-Agent': DEFAULT_USER_AGENT,
+            Accept: 'text/plain, */*',
+          },
+          body,
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!r.ok) return undefined;
+        const t = await r.text();
+        if (!t.trim() || /^\s*<!doctype/i.test(t) || t.includes('_cf_chl_opt')) return undefined;
+        return t.trim();
+      } catch {
+        return undefined;
+      }
+    };
+
+    const [nameEng, viStv, viGtx] = await Promise.all([
+      fetchGtx('en'),
+      fetchStvVi(),
+      fetchGtx('vi'),
+    ]);
+    return {
+      ...(viStv || viGtx ? { vi: viStv || viGtx } : {}),
+      ...(nameEng ? { nameEng } : {}),
+    };
   });
 }
 

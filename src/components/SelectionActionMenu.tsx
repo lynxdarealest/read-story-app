@@ -8,7 +8,8 @@ import {
   Search,
   Replace,
   Bookmark as BookmarkIcon,
-  Check
+  Check,
+  Languages
 } from 'lucide-react';
 import { Highlight } from '../types';
 
@@ -17,6 +18,7 @@ interface SelectionActionMenuProps {
   selectedText: string;
   disableEditActions?: boolean;
   onEdit: () => void;
+  onOpenQuickName?: () => void;
   onCopy: () => void;
   onHighlight: (color: Highlight['color']) => void;
   onAddNote: () => void;
@@ -32,6 +34,7 @@ export const SelectionActionMenu: React.FC<SelectionActionMenuProps> = ({
   selectedText,
   disableEditActions = false,
   onEdit,
+  onOpenQuickName,
   onCopy,
   onHighlight,
   onAddNote,
@@ -64,7 +67,7 @@ export const SelectionActionMenu: React.FC<SelectionActionMenuProps> = ({
   ];
 
   // Keep menu inside viewport boundaries
-  const menuWidth = 340;
+  const menuWidth = 390;
   const menuHeight = 44;
   const clampedX = Math.max(16, Math.min(window.innerWidth - menuWidth - 16, position.x - menuWidth / 2));
   const clampedY = position.y - menuHeight - 12 < 10 ? position.y + 24 : position.y - menuHeight - 12;
@@ -76,16 +79,23 @@ export const SelectionActionMenu: React.FC<SelectionActionMenuProps> = ({
       onMouseDown={(e) => e.stopPropagation()}
     >
       <div className="flex items-center space-x-0.5 p-1 bg-neutral-900/95 border border-neutral-700/80 rounded-xl shadow-2xl backdrop-blur-md text-neutral-200 text-xs">
+        {onOpenQuickName && (
+          <button
+            onClick={onOpenQuickName}
+            className="flex items-center space-x-1 px-2 py-1 rounded-lg bg-teal-600/30 hover:bg-teal-600/50 text-teal-300 transition-colors cursor-pointer"
+            title="Phân tích Trung / Việt / Hán Việt / Name Eng"
+          >
+            <Languages className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline font-medium">Name</span>
+          </button>
+        )}
+
         {/* Chỉnh sửa */}
         <button
           onClick={onEdit}
           disabled={disableEditActions}
           className="flex items-center space-x-1 px-2 py-1 rounded-lg hover:bg-neutral-800 hover:text-amber-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
-          title={
-            disableEditActions
-              ? 'Chuyển về Nguyên văn để sửa chương gốc'
-              : 'Chỉnh sửa đoạn này'
-          }
+          title="Chỉnh sửa đoạn này"
         >
           <Edit3 className="w-3.5 h-3.5" />
           <span className="hidden sm:inline">Sửa</span>

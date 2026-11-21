@@ -32,13 +32,9 @@ export const ChapterVersionModal: React.FC<ChapterVersionModalProps> = ({
   const [loading, setLoading] = React.useState(true);
   const [selectedVersionId, setSelectedVersionId] = React.useState<string | 'original'>('original');
   const [diffMode, setDiffMode] = React.useState<'diff' | 'full'>('diff');
+  const [confirmDeleteId, setConfirmDeleteId] = React.useState<string | null>(null);
 
-  React.useEffect(() => {
-    if (!isOpen) return;
-    loadVersions();
-  }, [isOpen, chapter.id]);
-
-  const loadVersions = async () => {
+  const loadVersions = React.useCallback(async () => {
     setLoading(true);
     try {
       const list = await getChapterVersions(chapter.id);
@@ -53,9 +49,13 @@ export const ChapterVersionModal: React.FC<ChapterVersionModalProps> = ({
     } finally {
       setLoading(false);
     }
-  };
+  }, [chapter.id]);
 
-  if (!isOpen) return null;
+  React.useEffect(() => {
+    if (!isOpen) return;
+    setConfirmDeleteId(null);
+    loadVersions();
+  }, [isOpen, loadVersions]);
 
   const originalContent = chapter.originalContent || chapter.content;
   const originalTitle = chapter.originalTitle || chapter.title;
@@ -76,7 +76,7 @@ export const ChapterVersionModal: React.FC<ChapterVersionModalProps> = ({
 
   const selectedContent = selectedVersion?.content || '';
 
-  // Generate lightweight paragraph-level diff
+  // Always call hooks unconditionally before conditional early return
   const diffLines = React.useMemo(() => {
     if (!selectedContent) return [];
     const sourceParas = selectedContent.split(/\r?\n+/).map((p) => p.trim()).filter(Boolean);
@@ -105,9 +105,11 @@ export const ChapterVersionModal: React.FC<ChapterVersionModalProps> = ({
     return result;
   }, [selectedContent, chapter.content]);
 
-  const handleDeleteVersion = async (verId: string) => {
-    if (!window.confirm('Bạn có chắc chắn muốn xóa bản lưu này không?')) return;
+  if (!isOpen) return null;
+
+  const handleConfirmDeleteVersion = async (verId: string) => {
     await deleteChapterVersion(verId);
+    setConfirmDeleteId(null);
     await loadVersions();
   };
 
@@ -193,16 +195,36 @@ export const ChapterVersionModal: React.FC<ChapterVersionModalProps> = ({
                 >
                   <div className="flex items-center justify-between">
                     <span className="font-semibold text-xs">Bản #{versions.length - idx}</span>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleDeleteVersion(ver.id);
-                      }}
-                      className="opacity-0 group-hover:opacity-100 p-1 text-neutral-400 hover:text-red-400 transition-opacity"
-                      title="Xóa bản lưu này"
-                    >
-                      <Trash2 className="w-3 h-3" />
-                    </button>
+                    {confirmDeleteId === ver.id ? (
+                      <div className="flex items-center space-x-1" onClick={(e) => e.stopPropagation()}>
+                        <button
+                          type="button"
+                          onClick={() => handleConfirmDeleteVersion(ver.id)}
+                          className="px-1.5 py-0.5 rounded bg-red-600 hover:bg-red-500 text-white text-[10px] font-semibold cursor-pointer"
+                        >
+                          Xóa
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteId(null)}
+                          className="px-1.5 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-[10px] cursor-pointer"
+                        >
+                          Hủy
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setConfirmDeleteId(ver.id);
+                        }}
+                        className="opacity-0 group-hover:opacity-100 p-1 text-neutral-400 hover:text-red-400 transition-opacity cursor-pointer"
+                        title="Xóa bản lưu này"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    )}
                   </div>
 
                   <p className="text-[11px] text-neutral-300 mt-0.5 truncate">{ver.summary}</p>

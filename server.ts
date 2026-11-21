@@ -1,5 +1,6 @@
 import express from 'express';
 import type { Request, Response } from 'express';
+import http from 'http';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -972,9 +973,133 @@ async function startServer() {
     }
   );
 
+  // Live phrase lookup for Quick Name & Manual Edit popup (Vietnamese + English Name)
+  app.post(
+    '/api/phrase-analyze',
+    express.json({ limit: '16kb' }),
+    async (req: Request, res: Response) => {
+      const rawPhrase = typeof req.body?.phrase === 'string' ? req.body.phrase.trim() : '';
+      if (!rawPhrase || rawPhrase.length > 160) {
+        res.status(400).json({ error: 'Cụm từ không hợp lệ.' });
+        return;
+      }
+
+      const fetchGtx = async (tl: 'en' | 'vi'): Promise<string | undefined> => {
+        try {
+          const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=zh-CN&tl=${tl}&dt=t&q=${encodeURIComponent(rawPhrase)}`;
+          const r = await fetch(url, {
+            headers: { 'User-Agent': DEFAULT_USER_AGENT },
+            signal: AbortSignal.timeout(4500),
+          });
+          if (!r.ok) return undefined;
+          const text = await r.text();
+          if (!text.trim().startsWith('[')) return undefined;
+          const data = JSON.parse(text);
+          if (Array.isArray(data?.[0])) {
+            const joined = data[0].map((part: any) => (Array.isArray(part) ? part[0] || '' : '')).join('').trim();
+            return joined || undefined;
+          }
+        } catch {
+          return undefined;
+        }
+        return undefined;
+      };
+
+      const fetchMyMemory = async (tl: 'en' | 'vi'): Promise<string | undefined> => {
+        try {
+          const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(rawPhrase)}&langpair=zh-CN|${tl}`;
+          const r = await fetch(url, { signal: AbortSignal.timeout(4500) });
+          if (!r.ok) return undefined;
+          const json: any = await r.json();
+          const candidate = json?.responseData?.translatedText;
+          if (
+            typeof candidate === 'string' &&
+            candidate.trim() &&
+            !/mymemory|names\/|rusn\d+/i.test(candidate)
+          ) {
+            return candidate.trim();
+          }
+        } catch {
+          return undefined;
+        }
+        return undefined;
+      };
+
+      const fetchStvVi = async (): Promise<string | undefined> => {
+        try {
+          const body = new URLSearchParams({ sajax: 'trans', content: rawPhrase }).toString();
+          const r = await fetch('https://comic.sangtacvietcdn.xyz/tsm.php?cdn=/', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+              'User-Agent': DEFAULT_USER_AGENT,
+              Accept: 'text/plain, */*',
+            },
+            body,
+            signal: AbortSignal.timeout(5000),
+          });
+          if (!r.ok) return undefined;
+          const t = await r.text();
+          if (!t.trim() || /^\s*<!doctype/i.test(t) || t.includes('_cf_chl_opt')) return undefined;
+          return t.trim();
+        } catch {
+          return undefined;
+        }
+      };
+
+      const [enGtx, viStv, viGtx] = await Promise.all([
+        fetchGtx('en'),
+        fetchStvVi(),
+        fetchGtx('vi'),
+      ]);
+
+      const nameEng = enGtx || (await fetchMyMemory('en'));
+      const vi = viStv || viGtx || (await fetchMyMemory('vi'));
+
+      res.json({
+        ...(vi ? { vi } : {}),
+        ...(nameEng ? { nameEng } : {}),
+      });
+    }
+  );
+
+
+  const httpServer = http.createServer(app);
+
   if (process.env.NODE_ENV !== 'production') {
+    const disableHmr = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      plugins: [
+        {
+          name: 'safe-hmr-client',
+          enforce: 'post',
+          transform(code, id) {
+            if (!id.replace(/\\/g, '/').endsWith('vite/dist/client/client.mjs')) return null;
+            if (disableHmr) {
+              return code.replace(
+                'transport.connect(createHMRHandler(handleMessage));',
+                '/* HMR disabled */'
+              );
+            }
+            return code
+              .replace(
+                /console\.error\(`\[vite\] failed to connect to websocket[^`]*`\);/g,
+                ''
+              )
+              .replace(
+                /console\.error\(`\[vite\] failed to connect to websocket \(\$\{e\}\)\. `\);\s*throw e;/,
+                'return;'
+              )
+              .replace(
+                'transport.connect(createHMRHandler(handleMessage));',
+                'Promise.resolve(transport.connect(createHMRHandler(handleMessage))).catch(() => {});'
+              );
+          },
+        },
+      ],
+      server: disableHmr
+        ? { middlewareMode: true, hmr: false, ws: false }
+        : { middlewareMode: true, ws: { server: httpServer } },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -986,7 +1111,7 @@ async function startServer() {
     });
   }
 
-  app.listen(port, '0.0.0.0', () => {
+  httpServer.listen(port, '0.0.0.0', () => {
     console.log(`Server listening on http://0.0.0.0:${port}`);
   });
 }

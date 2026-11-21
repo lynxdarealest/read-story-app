@@ -18,6 +18,9 @@ interface ChapterEditorModalProps {
   isOpen: boolean;
   onClose: () => void;
   chapter: Chapter;
+  isTranslationMode?: boolean;
+  titleOverride?: string;
+  contentOverride?: string;
   initialParagraphIndex?: number;
   onSaveChapter: (chapterId: string, updatedTitle: string, updatedContent: string, summary: string) => Promise<void>;
   onOpenVersions: () => void;
@@ -28,35 +31,43 @@ export const ChapterEditorModal: React.FC<ChapterEditorModalProps> = ({
   isOpen,
   onClose,
   chapter,
+  isTranslationMode = false,
+  titleOverride,
+  contentOverride,
   initialParagraphIndex,
   onSaveChapter,
   onOpenVersions,
   onRestoreOriginal,
 }) => {
-  const [title, setTitle] = React.useState(chapter.title);
-  const [content, setContent] = React.useState(chapter.content);
+  const effectiveTitle = isTranslationMode && titleOverride !== undefined ? titleOverride : chapter.title;
+  const effectiveContent = isTranslationMode && contentOverride !== undefined ? contentOverride : chapter.content;
+
+  const [title, setTitle] = React.useState(effectiveTitle);
+  const [content, setContent] = React.useState(effectiveContent);
   const [isSaving, setIsSaving] = React.useState(false);
   const [savedSuccess, setSavedSuccess] = React.useState(false);
+  const [confirmRestoreOriginal, setConfirmRestoreOriginal] = React.useState(false);
 
   // Undo / Redo history
-  const [history, setHistory] = React.useState<string[]>([chapter.content]);
+  const [history, setHistory] = React.useState<string[]>([effectiveContent]);
   const [historyIndex, setHistoryIndex] = React.useState(0);
 
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
 
   React.useEffect(() => {
     if (isOpen) {
-      setTitle(chapter.title);
-      setContent(chapter.content);
-      setHistory([chapter.content]);
+      setTitle(effectiveTitle);
+      setContent(effectiveContent);
+      setHistory([effectiveContent]);
       setHistoryIndex(0);
       setSavedSuccess(false);
+      setConfirmRestoreOriginal(false);
 
       // If initialParagraphIndex specified, scroll to that paragraph
       if (initialParagraphIndex !== undefined && textareaRef.current) {
         setTimeout(() => {
           if (!textareaRef.current) return;
-          const paras = chapter.content.split(/\r?\n+/);
+          const paras = effectiveContent.split(/\r?\n+/);
           let charOffset = 0;
           for (let i = 0; i < Math.min(initialParagraphIndex, paras.length); i++) {
             charOffset += paras[i].length + 2;
@@ -66,7 +77,7 @@ export const ChapterEditorModal: React.FC<ChapterEditorModalProps> = ({
         }, 100);
       }
     }
-  }, [isOpen, chapter.id, chapter.title, chapter.content, initialParagraphIndex]);
+  }, [isOpen, chapter.id, effectiveTitle, effectiveContent, initialParagraphIndex]);
 
   if (!isOpen) return null;
 
@@ -159,7 +170,12 @@ export const ChapterEditorModal: React.FC<ChapterEditorModalProps> = ({
   const handleSave = async () => {
     setIsSaving(true);
     try {
-      await onSaveChapter(chapter.id, title.trim() || chapter.title, content, 'Chỉnh sửa trực tiếp');
+      await onSaveChapter(
+        chapter.id,
+        title.trim() || effectiveTitle,
+        content,
+        isTranslationMode ? 'Chỉnh sửa thủ công bản dịch' : 'Chỉnh sửa trực tiếp'
+      );
       setSavedSuccess(true);
       setTimeout(() => setSavedSuccess(false), 2000);
     } catch (err) {
@@ -171,7 +187,7 @@ export const ChapterEditorModal: React.FC<ChapterEditorModalProps> = ({
 
   const wordCount = content.trim().split(/\s+/).filter(Boolean).length;
   const originalContent = chapter.originalContent || chapter.content;
-  const isModified = content !== originalContent || title !== (chapter.originalTitle || chapter.title);
+  const isModified = !isTranslationMode && (content !== originalContent || title !== (chapter.originalTitle || chapter.title));
 
   return (
     <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-3 sm:p-5">
@@ -180,7 +196,7 @@ export const ChapterEditorModal: React.FC<ChapterEditorModalProps> = ({
         <div className="px-5 py-3 border-b border-neutral-800 flex items-center justify-between bg-neutral-950">
           <div className="flex items-center space-x-3 flex-1 min-w-0 mr-4">
             <span className="text-xs font-bold text-amber-500 uppercase tracking-wide shrink-0">
-              Chỉnh sửa chương:
+              {isTranslationMode ? 'Chỉnh sửa bản dịch:' : 'Chỉnh sửa chương:'}
             </span>
             <input
               type="text"
@@ -252,32 +268,53 @@ export const ChapterEditorModal: React.FC<ChapterEditorModalProps> = ({
 
           {/* Right Actions: Versions & Reset Original */}
           <div className="flex items-center space-x-2">
-            <button
-              type="button"
-              onClick={onOpenVersions}
-              className="flex items-center space-x-1 px-2.5 py-1.5 rounded-lg bg-neutral-900 border border-neutral-800 hover:bg-neutral-800 text-amber-400 font-medium transition-colors cursor-pointer"
-              title="Xem các bản lưu lịch sử"
-            >
-              <History className="w-3.5 h-3.5" />
-              <span>Lịch sử phiên bản</span>
-            </button>
-
-            {isModified && (
+            {!isTranslationMode && (
               <button
                 type="button"
-                onClick={() => {
-                  if (window.confirm('Khôi phục nội dung về bản gốc ban đầu khi nhập file?')) {
-                    onRestoreOriginal();
-                    setContent(originalContent);
-                    setTitle(chapter.originalTitle || chapter.title);
-                  }
-                }}
-                className="flex items-center space-x-1 px-2.5 py-1.5 rounded-lg bg-neutral-900 border border-neutral-800 hover:bg-neutral-800 text-neutral-400 hover:text-red-400 transition-colors cursor-pointer"
-                title="Khôi phục nguyên bản"
+                onClick={onOpenVersions}
+                className="flex items-center space-x-1 px-2.5 py-1.5 rounded-lg bg-neutral-900 border border-neutral-800 hover:bg-neutral-800 text-amber-400 font-medium transition-colors cursor-pointer"
+                title="Xem các bản lưu lịch sử"
               >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>Khôi phục gốc</span>
+                <History className="w-3.5 h-3.5" />
+                <span>Lịch sử phiên bản</span>
               </button>
+            )}
+
+            {isModified && (
+              confirmRestoreOriginal ? (
+                <div className="flex items-center space-x-1.5 px-2 py-1 rounded-lg bg-red-950/50 border border-red-700/50">
+                  <span className="text-[11px] text-red-200">Khôi phục gốc?</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onRestoreOriginal();
+                      setContent(originalContent);
+                      setTitle(chapter.originalTitle || chapter.title);
+                      setConfirmRestoreOriginal(false);
+                    }}
+                    className="px-2 py-0.5 rounded bg-red-600 hover:bg-red-500 text-white text-[11px] font-semibold cursor-pointer"
+                  >
+                    Xác nhận
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmRestoreOriginal(false)}
+                    className="px-2 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-[11px] cursor-pointer"
+                  >
+                    Hủy
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirmRestoreOriginal(true)}
+                  className="flex items-center space-x-1 px-2.5 py-1.5 rounded-lg bg-neutral-900 border border-neutral-800 hover:bg-neutral-800 text-neutral-400 hover:text-red-400 transition-colors cursor-pointer"
+                  title="Khôi phục nguyên bản"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Khôi phục gốc</span>
+                </button>
+              )
             )}
           </div>
         </div>

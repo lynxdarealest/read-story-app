@@ -60,6 +60,7 @@ export const ChapterManagerModal: React.FC<ChapterManagerModalProps> = ({
   // Split chapter at cursor / text state
   const [splittingChapterId, setSplittingChapterId] = React.useState<string | null>(null);
   const [splitKeyword, setSplitKeyword] = React.useState('');
+  const [splitError, setSplitError] = React.useState<string | null>(null);
 
   const [searchFilter, setSearchFilter] = React.useState('');
 
@@ -70,6 +71,7 @@ export const ChapterManagerModal: React.FC<ChapterManagerModalProps> = ({
       setEditingChapterId(null);
       setIsAddingNew(false);
       setSplittingChapterId(null);
+      setSplitError(null);
       setActiveTab('list');
 
       // Test default regex on full content if available
@@ -154,18 +156,22 @@ export const ChapterManagerModal: React.FC<ChapterManagerModalProps> = ({
     if (editingChapterId === chId) setEditingChapterId(null);
   };
 
-  // Merge with previous chapter
-  const handleMergeWithPrev = (index: number) => {
-    if (index <= 0) return;
+  // Merge with previous chapter (lookup by chapter ID in full draftChapters so filtered search doesn't mis-index)
+  const handleMergeWithPrev = (chId: string) => {
     setDraftChapters((prev) => {
+      const targetIndex = prev.findIndex((c) => c.id === chId);
+      if (targetIndex <= 0) return prev;
       const copy = [...prev];
-      const prevCh = copy[index - 1];
-      const currentCh = copy[index];
+      const prevCh = copy[targetIndex - 1];
+      const currentCh = copy[targetIndex];
+      const mergedContent = prevCh.content + '\n\n' + currentCh.content;
 
-      prevCh.content = prevCh.content + '\n\n' + currentCh.content;
-      prevCh.wordCount = countWords(prevCh.content);
-
-      copy.splice(index, 1);
+      copy[targetIndex - 1] = {
+        ...prevCh,
+        content: mergedContent,
+        wordCount: countWords(mergedContent),
+      };
+      copy.splice(targetIndex, 1);
       return copy.map((c, idx) => ({ ...c, chapterIndex: idx }));
     });
   };
@@ -204,10 +210,11 @@ export const ChapterManagerModal: React.FC<ChapterManagerModalProps> = ({
     const currentCh = draftChapters[targetIndex];
     const splitIndex = currentCh.content.indexOf(splitKeyword);
     if (splitIndex === -1) {
-      alert('Không tìm thấy từ khóa tách trong nội dung chương.');
+      setSplitError('Không tìm thấy từ khóa tách trong nội dung chương.');
       return;
     }
 
+    setSplitError(null);
     const part1Content = currentCh.content.slice(0, splitIndex).trim();
     const part2Content = currentCh.content.slice(splitIndex).trim();
 
@@ -234,6 +241,7 @@ export const ChapterManagerModal: React.FC<ChapterManagerModalProps> = ({
 
     setSplittingChapterId(null);
     setSplitKeyword('');
+    setSplitError(null);
   };
 
   // Save all changes to IndexedDB
@@ -511,7 +519,10 @@ export const ChapterManagerModal: React.FC<ChapterManagerModalProps> = ({
                   <div className="flex justify-between items-center">
                     <span className="font-semibold text-amber-400">Tách chương làm đôi</span>
                     <button
-                      onClick={() => setSplittingChapterId(null)}
+                      onClick={() => {
+                        setSplittingChapterId(null);
+                        setSplitError(null);
+                      }}
                       className="text-neutral-400 hover:text-white"
                     >
                       <X className="w-3.5 h-3.5" />
@@ -520,13 +531,25 @@ export const ChapterManagerModal: React.FC<ChapterManagerModalProps> = ({
                   <input
                     type="text"
                     value={splitKeyword}
-                    onChange={(e) => setSplitKeyword(e.target.value)}
+                    onChange={(e) => {
+                      setSplitKeyword(e.target.value);
+                      if (splitError) setSplitError(null);
+                    }}
                     placeholder="Nhập cụm từ bắt đầu của phần 2..."
-                    className="w-full px-2.5 py-1 bg-neutral-900 border border-neutral-800 rounded text-xs text-neutral-200 focus:outline-none"
+                    className="w-full px-2.5 py-1 bg-neutral-900 border border-neutral-800 rounded text-xs text-neutral-200 focus:outline-none focus:border-amber-500"
                   />
+                  {splitError && (
+                    <div className="flex items-center space-x-1.5 text-[11px] text-red-400">
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                      <span>{splitError}</span>
+                    </div>
+                  )}
                   <div className="flex justify-end space-x-2">
                     <button
-                      onClick={() => setSplittingChapterId(null)}
+                      onClick={() => {
+                        setSplittingChapterId(null);
+                        setSplitError(null);
+                      }}
                       className="px-3 py-1 rounded bg-neutral-800 text-neutral-300"
                     >
                       Hủy
@@ -554,7 +577,7 @@ export const ChapterManagerModal: React.FC<ChapterManagerModalProps> = ({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-neutral-850">
-                    {filteredChapters.map((ch, idx) => (
+                    {filteredChapters.map((ch) => (
                       <tr key={ch.id} className="hover:bg-neutral-900/60 transition-colors">
                         <td className="py-2 px-3 text-center text-neutral-500 font-mono text-[11px]">
                           {ch.chapterIndex + 1}
@@ -581,15 +604,18 @@ export const ChapterManagerModal: React.FC<ChapterManagerModalProps> = ({
                               <Edit2 className="w-3.5 h-3.5" />
                             </button>
                             <button
-                              onClick={() => setSplittingChapterId(ch.id)}
+                              onClick={() => {
+                                setSplittingChapterId(ch.id);
+                                setSplitError(null);
+                              }}
                               className="p-1 text-neutral-400 hover:text-amber-400 rounded hover:bg-neutral-800"
                               title="Tách chương làm đôi"
                             >
                               <Split className="w-3.5 h-3.5" />
                             </button>
-                            {idx > 0 && (
+                            {ch.chapterIndex > 0 && (
                               <button
-                                onClick={() => handleMergeWithPrev(idx)}
+                                onClick={() => handleMergeWithPrev(ch.id)}
                                 className="p-1 text-neutral-400 hover:text-amber-400 rounded hover:bg-neutral-800"
                                 title="Gộp với chương trước"
                               >

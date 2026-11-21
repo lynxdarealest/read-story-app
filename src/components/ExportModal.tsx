@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import { Book, Chapter } from '../types';
 import { exportBookToTXT, exportBookToEPUB } from '../services/exporter';
+import { getBookTranslations } from '../services/storage';
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -25,9 +26,18 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   chapters,
 }) => {
   const [format, setFormat] = React.useState<'TXT' | 'EPUB'>('EPUB');
+  const [preferTranslated, setPreferTranslated] = React.useState(true);
+  const [translatedCount, setTranslatedCount] = React.useState(0);
   const [isExporting, setIsExporting] = React.useState(false);
   const [success, setSuccess] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+    getBookTranslations(book.id)
+      .then((list) => setTranslatedCount(list.length))
+      .catch(() => setTranslatedCount(0));
+  }, [isOpen, book.id]);
 
   if (!isOpen) return null;
 
@@ -39,10 +49,26 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     setSuccess(false);
 
     try {
+      let chaptersToExport = chapters;
+      if (preferTranslated && translatedCount > 0) {
+        const translations = await getBookTranslations(book.id);
+        const transMap = new Map(translations.map((t) => [t.chapterId, t]));
+        chaptersToExport = chapters.map((ch) => {
+          const tr = transMap.get(ch.id);
+          return tr
+            ? {
+                ...ch,
+                title: tr.translatedTitle || ch.title,
+                content: tr.translatedContent || ch.content,
+              }
+            : ch;
+        });
+      }
+
       if (format === 'TXT') {
-        exportBookToTXT(book, chapters);
+        exportBookToTXT(book, chaptersToExport);
       } else {
-        await exportBookToEPUB(book, chapters);
+        await exportBookToEPUB(book, chaptersToExport);
       }
       setSuccess(true);
       setTimeout(() => {
@@ -130,6 +156,20 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               </div>
             </div>
           </div>
+
+          {translatedCount > 0 && (
+            <label className="flex items-center space-x-2.5 p-3 rounded-xl bg-emerald-950/30 border border-emerald-700/40 text-neutral-200 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={preferTranslated}
+                onChange={(e) => setPreferTranslated(e.target.checked)}
+                className="accent-emerald-500 rounded"
+              />
+              <span className="text-[11px]">
+                Xuất theo bản dịch đã lưu &amp; chỉnh sửa ({translatedCount} chương)
+              </span>
+            </label>
+          )}
 
           {error && (
             <div className="p-2.5 rounded-lg bg-red-950/40 border border-red-800/50 text-red-300 text-xs flex items-center space-x-2">

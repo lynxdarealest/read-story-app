@@ -14,6 +14,7 @@ interface ReaderSearchProps {
   onClose: () => void;
   chapters: Chapter[];
   currentChapterIndex: number;
+  initialQuery?: string;
   onJumpToResult: (chapterIndex: number, textSnippet: string) => void;
 }
 
@@ -22,9 +23,10 @@ export const ReaderSearch: React.FC<ReaderSearchProps> = ({
   onClose,
   chapters,
   currentChapterIndex,
+  initialQuery,
   onJumpToResult,
 }) => {
-  const [searchQuery, setSearchQuery] = React.useState('');
+  const [searchQuery, setSearchQuery] = React.useState(initialQuery || '');
   const [searchScope, setSearchScope] = React.useState<'chapter' | 'book'>('chapter');
   const [results, setResults] = React.useState<SearchResult[]>([]);
   const [isSearching, setIsSearching] = React.useState(false);
@@ -32,9 +34,12 @@ export const ReaderSearch: React.FC<ReaderSearchProps> = ({
 
   React.useEffect(() => {
     if (isOpen) {
+      if (initialQuery) {
+        setSearchQuery(initialQuery);
+      }
       setTimeout(() => inputRef.current?.focus(), 50);
     }
-  }, [isOpen]);
+  }, [isOpen, initialQuery]);
 
   // Execute search
   const handleSearch = () => {

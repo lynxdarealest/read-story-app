@@ -225,10 +225,15 @@ export function splitTextByRule(
   let m: RegExpExecArray | null;
 
   while ((m = regex.exec(cleanedText)) !== null) {
+    // Guard against infinite loops on zero-length matches
+    if (m.index === regex.lastIndex) {
+      regex.lastIndex++;
+    }
     // The match could start with a newline, trim it for clean title
     const fullMatch = m[0].trim();
+    if (!fullMatch) continue;
     matches.push({
-      index: m.index + (m[0].indexOf(fullMatch)),
+      index: m.index + m[0].indexOf(fullMatch),
       fullMatch,
       title: fullMatch,
     });
@@ -336,6 +341,32 @@ function splitIntoChunks(text: string, targetWordsPerChunk = 3500): Array<{ titl
   return chapters;
 }
 
+function resolveEpubZipFile(zip: JSZip, baseDir: string, href: string) {
+  const cleanHref = href.split('#')[0].split('?')[0];
+  const combined = (baseDir + cleanHref).replace(/\\/g, '/');
+  const segments: string[] = [];
+  for (const part of combined.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') {
+      segments.pop();
+    } else {
+      segments.push(part);
+    }
+  }
+  const normalized = segments.join('/');
+  const candidates = [normalized, cleanHref];
+  try {
+    candidates.push(decodeURIComponent(normalized), decodeURIComponent(cleanHref));
+  } catch {
+    // ignore malformed URI sequences
+  }
+  for (const c of candidates) {
+    const found = zip.file(c);
+    if (found) return found;
+  }
+  return null;
+}
+
 // EPUB Parser
 export async function parseEpubFile(file: File): Promise<ParsedBookDraft> {
   const zip = await JSZip.loadAsync(file);
@@ -366,23 +397,27 @@ export async function parseEpubFile(file: File): Promise<ParsedBookDraft> {
   const description = opfDoc.querySelector('description')?.textContent?.trim() || '';
 
   // Manifest items
-  const manifestItems: Record<string, { href: string; mediaType: string }> = {};
+  const manifestItems: Record<string, { href: string; mediaType: string; properties: string }> = {};
   opfDoc.querySelectorAll('manifest > item').forEach((item) => {
     const id = item.getAttribute('id');
     const href = item.getAttribute('href');
     const mediaType = item.getAttribute('media-type');
+    const properties = item.getAttribute('properties') || '';
     if (id && href && mediaType) {
-      manifestItems[id] = { href, mediaType };
+      manifestItems[id] = { href, mediaType, properties };
     }
   });
 
-  // Extract cover image if available
+  // Extract cover image if available (supports both EPUB2 meta[name="cover"] and EPUB3 properties="cover-image")
   let coverUrl: string | undefined;
   const coverMeta = opfDoc.querySelector('meta[name="cover"]');
-  const coverItemId = coverMeta?.getAttribute('content');
+  const coverItemId =
+    coverMeta?.getAttribute('content') ||
+    Object.keys(manifestItems).find((id) =>
+      manifestItems[id].properties.split(/\s+/).includes('cover-image')
+    );
   if (coverItemId && manifestItems[coverItemId]) {
-    const coverPath = opfDir + manifestItems[coverItemId].href;
-    const coverFile = zip.file(coverPath);
+    const coverFile = resolveEpubZipFile(zip, opfDir, manifestItems[coverItemId].href);
     if (coverFile) {
       const coverBase64 = await coverFile.async('base64');
       coverUrl = `data:${manifestItems[coverItemId].mediaType};base64,${coverBase64}`;
@@ -402,8 +437,7 @@ export async function parseEpubFile(file: File): Promise<ParsedBookDraft> {
     const manifestItem = manifestItems[idref];
     if (!manifestItem) continue;
 
-    const filePath = opfDir + manifestItem.href;
-    const chapterFile = zip.file(filePath);
+    const chapterFile = resolveEpubZipFile(zip, opfDir, manifestItem.href);
     if (!chapterFile) continue;
 
     const htmlStr = await chapterFile.async('text');
@@ -419,8 +453,8 @@ export async function parseEpubFile(file: File): Promise<ParsedBookDraft> {
     const bodyEl = doc.body;
     let cleanText = '';
     if (bodyEl) {
-      // Collect paragraphs
-      const pElements = Array.from(bodyEl.querySelectorAll('p, div, h1, h2, h3, h4, blockquote'));
+      bodyEl.querySelectorAll('script, style, noscript').forEach((el) => el.remove());
+      const pElements = Array.from(bodyEl.querySelectorAll('p, h1, h2, h3, h4, blockquote, li'));
       if (pElements.length > 0) {
         cleanText = pElements
           .map((el) => el.textContent?.trim())
@@ -462,17 +496,43 @@ export async function parseEpubFile(file: File): Promise<ParsedBookDraft> {
 
 // HTML / Markdown parser
 export async function parseHtmlOrMdFile(file: File): Promise<ParsedBookDraft> {
-  const text = await readFileAsText(file);
-  const title = file.name.replace(/\.[^/.]+$/, '');
-  const chapters = splitTextByRule(text, DEFAULT_CHAPTER_RULES[0].pattern, 'gi', title);
+  const rawText = await readFileAsText(file);
+  const isMarkdown = file.name.toLowerCase().endsWith('.md');
+  let title = file.name.replace(/\.[^/.]+$/, '');
+  let cleanText = rawText;
+
+  if (!isMarkdown) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(rawText, 'text/html');
+    const docTitle = doc.querySelector('h1, title')?.textContent?.trim();
+    if (docTitle) {
+      title = docTitle;
+    }
+    doc.querySelectorAll('script, style, noscript').forEach((el) => el.remove());
+    const bodyEl = doc.body;
+    if (bodyEl) {
+      const blocks = Array.from(bodyEl.querySelectorAll('h1, h2, h3, h4, p, blockquote, li'));
+      if (blocks.length > 0) {
+        cleanText = blocks
+          .map((el) => el.textContent?.trim())
+          .filter((t): t is string => Boolean(t && t.length > 0))
+          .join('\n\n');
+      } else {
+        cleanText = bodyEl.textContent?.trim() || rawText;
+      }
+    }
+  }
+
+  const chapters = splitTextByRule(cleanText, DEFAULT_CHAPTER_RULES[0].pattern, 'gi', title);
 
   return {
     title,
     author: 'Khuyết danh',
     description: '',
-    format: file.name.endsWith('.md') ? 'MD' : 'HTML',
+    format: isMarkdown ? 'MD' : 'HTML',
     sourceFileName: file.name,
     fileSize: file.size,
+    rawText: cleanText,
     chapters,
   };
 }

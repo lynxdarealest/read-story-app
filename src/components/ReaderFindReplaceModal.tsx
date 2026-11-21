@@ -16,6 +16,7 @@ interface ReaderFindReplaceModalProps {
   onClose: () => void;
   currentChapter: Chapter;
   chapters: Chapter[];
+  isTranslationMode?: boolean;
   initialSearchText?: string;
   onUpdateChapterContent: (chapterId: string, newContent: string, summary: string) => Promise<void>;
   onBatchUpdateChapters: (updatedChapters: Chapter[], summary: string) => Promise<void>;
@@ -26,6 +27,7 @@ export const ReaderFindReplaceModal: React.FC<ReaderFindReplaceModalProps> = ({
   onClose,
   currentChapter,
   chapters,
+  isTranslationMode = false,
   initialSearchText = '',
   onUpdateChapterContent,
   onBatchUpdateChapters,
@@ -199,7 +201,9 @@ export const ReaderFindReplaceModal: React.FC<ReaderFindReplaceModalProps> = ({
         <div className="px-5 py-3 border-b border-neutral-800 flex items-center justify-between bg-neutral-950">
           <div className="flex items-center space-x-2">
             <Replace className="w-4 h-4 text-amber-500" />
-            <h2 className="text-sm font-bold text-neutral-100">Tìm kiếm & Thay thế</h2>
+            <h2 className="text-sm font-bold text-neutral-100">
+              {isTranslationMode ? 'Tìm kiếm & Thay thế (Bản dịch)' : 'Tìm kiếm & Thay thế'}
+            </h2>
           </div>
           <button
             onClick={onClose}

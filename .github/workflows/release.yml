@@ -7,12 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag, for example v0.1.2'
+        description: 'Release version, for example 0.1.2 or v0.1.2'
         required: true
         type: string
 
 env:
-  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+  RELEASE_TAG: ${{ inputs.release_tag && (startsWith(inputs.release_tag, 'v') && inputs.release_tag || format('v{0}', inputs.release_tag)) || github.ref_name }}
 
 permissions:
   contents: write

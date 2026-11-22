@@ -65,7 +65,7 @@ import {
   translateChapterWithSangTacViet,
   TranslationProgress
 } from '../services/translator';
-import { containsCjk } from '../services/chineseTools';
+import { containsCjk, findBestMatchingSourceParagraph } from '../services/chineseTools';
 import { ttsService, TTSState } from '../services/tts';
 import {
   saveBook,
@@ -274,11 +274,17 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     [globalDictionaries, bookDictionaries]
   );
 
-  // Translation state (SangTacViet online + IndexedDB cache)
+  // Translation state (whole book online + IndexedDB cache)
   const [currentTranslation, setCurrentTranslation] = React.useState<ChapterTranslation | null>(null);
   const [readingViewMode, setReadingViewMode] = React.useState<'original' | 'translated'>('original');
   const [isTranslating, setIsTranslating] = React.useState(false);
-  const [translationProgress, setTranslationProgress] = React.useState<TranslationProgress | null>(null);
+  const [translationProgress, setTranslationProgress] = React.useState<{
+    completedChapters: number;
+    totalChapters: number;
+    currentChapterNumber: number;
+    chunkProgress?: TranslationProgress | null;
+  } | null>(null);
+  const [bookTranslatedCount, setBookTranslatedCount] = React.useState(0);
   const [translationError, setTranslationError] = React.useState<string | null>(null);
   const translationAbortRef = React.useRef<AbortController | null>(null);
 
@@ -379,15 +385,29 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     };
   }, [book.id]);
 
+  const currentChapterIdRef = React.useRef(currentChapter.id);
+  React.useEffect(() => {
+    currentChapterIdRef.current = currentChapter.id;
+  }, [currentChapter.id]);
+
+  // Refresh saved translated chapter count for this book
+  const refreshBookTranslatedCount = React.useCallback(async () => {
+    try {
+      const list = await getBookTranslations(book.id);
+      setBookTranslatedCount(list.length);
+    } catch {
+      // Ignore read failures
+    }
+  }, [book.id]);
+
+  React.useEffect(() => {
+    refreshBookTranslatedCount();
+  }, [refreshBookTranslatedCount, localChapters.length]);
+
   // Load saved chapter translation from IndexedDB when switching chapters
+  // (Keep any in-progress whole-book translation running when user navigates chapters)
   React.useEffect(() => {
     let isMounted = true;
-    if (translationAbortRef.current) {
-      translationAbortRef.current.abort();
-      translationAbortRef.current = null;
-    }
-    setIsTranslating(false);
-    setTranslationProgress(null);
     setTranslationError(null);
     setEditingParagraphIndex(null);
 
@@ -425,8 +445,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     };
   }, []);
 
-  const handleTranslateCurrentChapter = async () => {
-    if (!currentChapter?.id || currentChapter.id === 'empty') return;
+  const handleTranslateBook = async (options?: { retranslateAll?: boolean }) => {
+    const validChapters = localChapters.filter((ch) => ch.id && ch.id !== 'empty' && ch.content.trim());
+    if (validChapters.length === 0) {
+      showHUDToast('Truyện chưa có nội dung để dịch');
+      return;
+    }
+
     if (translationAbortRef.current) {
       translationAbortRef.current.abort();
     }
@@ -435,36 +460,139 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
     setIsTranslating(true);
     setTranslationError(null);
-    setTranslationProgress(null);
+
+    let completedCount = 0;
+    let totalToTranslate = 0;
 
     try {
-      const [latestGlobal, latestBook] = await Promise.all([
+      const [latestGlobal, latestBook, existingList] = await Promise.all([
         getDictionaries(GLOBAL_DICTIONARY_BOOK_ID),
         getDictionaries(book.id),
+        getBookTranslations(book.id),
       ]);
       setGlobalDictionaries(latestGlobal);
       setBookDictionaries(latestBook);
 
-      const result = await translateChapterWithSangTacViet({
-        chapter: currentChapter,
-        globalEntries: latestGlobal,
-        bookEntries: latestBook,
-        onProgress: (prog) => setTranslationProgress(prog),
-        signal: controller.signal,
+      const existingMap = new Map(existingList.map((t) => [t.chapterId, t]));
+
+      // Start from the chapter the user is currently reading so it updates immediately, then wrap around
+      const startPos = Math.max(
+        0,
+        validChapters.findIndex((c) => c.id === currentChapter.id)
+      );
+      const orderedChapters = [
+        ...validChapters.slice(startPos),
+        ...validChapters.slice(0, startPos),
+      ];
+
+      const retranslateAll = Boolean(options?.retranslateAll);
+      const queue = retranslateAll
+        ? orderedChapters
+        : orderedChapters.filter((ch) => {
+            const existing = existingMap.get(ch.id);
+            return !existing || isTranslationStale(ch, existing);
+          });
+
+      if (queue.length === 0) {
+        setBookTranslatedCount(existingList.length);
+        showHUDToast('Toàn bộ truyện đã có bản dịch mới nhất');
+        return;
+      }
+
+      totalToTranslate = queue.length;
+      setTranslationProgress({
+        completedChapters: 0,
+        totalChapters: totalToTranslate,
+        currentChapterNumber: (queue[0]?.chapterIndex ?? 0) + 1,
+        chunkProgress: null,
       });
 
-      await saveChapterTranslation(result);
-      setCurrentTranslation(result);
-      setContinuousTranslations((prev) => ({ ...prev, [result.chapterId]: result }));
-      setReadingViewMode('translated');
-      setCurrentPageIndex(0);
-      setEditingParagraphIndex(null);
-      showHUDToast('Đã dịch và lưu bản dịch chương');
+      const savedIds = new Set(existingList.map((t) => t.chapterId));
+
+      for (let i = 0; i < queue.length; i++) {
+        if (controller.signal.aborted) {
+          throw new Error('Đã hủy yêu cầu dịch.');
+        }
+
+        const ch = queue[i];
+        setTranslationProgress({
+          completedChapters: completedCount,
+          totalChapters: totalToTranslate,
+          currentChapterNumber: ch.chapterIndex + 1,
+          chunkProgress: null,
+        });
+
+        let result: ChapterTranslation | null = null;
+        let lastErr: any = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (controller.signal.aborted) {
+            throw new Error('Đã hủy yêu cầu dịch.');
+          }
+          try {
+            result = await translateChapterWithSangTacViet({
+              chapter: ch,
+              globalEntries: latestGlobal,
+              bookEntries: latestBook,
+              onProgress: (chunkProg) => {
+                setTranslationProgress({
+                  completedChapters: completedCount,
+                  totalChapters: totalToTranslate,
+                  currentChapterNumber: ch.chapterIndex + 1,
+                  chunkProgress: chunkProg,
+                });
+              },
+              signal: controller.signal,
+            });
+            break;
+          } catch (err: any) {
+            if (controller.signal.aborted || err?.message?.includes('Đã hủy')) {
+              throw err;
+            }
+            lastErr = err;
+            if (attempt === 0) {
+              await new Promise((r) => setTimeout(r, 600));
+            }
+          }
+        }
+
+        if (!result) {
+          throw lastErr || new Error(`Không thể dịch chương ${ch.chapterIndex + 1}`);
+        }
+
+        await saveChapterTranslation(result);
+        savedIds.add(result.chapterId);
+        completedCount++;
+
+        setBookTranslatedCount(savedIds.size);
+        setContinuousTranslations((prev) => ({ ...prev, [result!.chapterId]: result! }));
+
+        if (result.chapterId === currentChapterIdRef.current) {
+          setCurrentTranslation(result);
+          setReadingViewMode('translated');
+          setCurrentPageIndex(0);
+          setEditingParagraphIndex(null);
+        }
+
+        setTranslationProgress({
+          completedChapters: completedCount,
+          totalChapters: totalToTranslate,
+          currentChapterNumber: ch.chapterIndex + 1,
+          chunkProgress: null,
+        });
+      }
+
+      showHUDToast(`Đã dịch xong toàn truyện (${completedCount} chương)`);
     } catch (err: any) {
-      if (err?.message === 'Đã hủy yêu cầu dịch chương.') {
-        showHUDToast('Đã hủy dịch chương');
+      if (controller.signal.aborted || err?.message?.includes('Đã hủy')) {
+        showHUDToast(
+          completedCount > 0
+            ? `Đã dừng dịch (đã lưu ${completedCount}/${totalToTranslate} chương)`
+            : 'Đã hủy dịch truyện'
+        );
       } else {
-        setTranslationError(err?.message || 'Lỗi không xác định khi dịch chương.');
+        const prefix =
+          completedCount > 0 ? `Đã lưu ${completedCount}/${totalToTranslate} chương. ` : '';
+        setTranslationError(`${prefix}${err?.message || 'Lỗi không xác định khi dịch truyện.'}`);
       }
     } finally {
       setIsTranslating(false);
@@ -2067,96 +2195,129 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   </div>
 
                   {isTranslating ? (
-                    <div className="px-3 py-2 flex items-center justify-between gap-2 bg-neutral-800/60 mx-1.5 rounded-lg">
-                      <span className="flex items-center space-x-2 text-cyan-300">
-                        <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
-                        <span>
-                          Đang dịch
-                          {translationProgress && translationProgress.totalChunks > 1
-                            ? ` (${translationProgress.completedChunks}/${translationProgress.totalChunks})`
-                            : '...'}
-                        </span>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          translationAbortRef.current?.abort();
-                          setShowMoreMenu(false);
-                        }}
-                        className="px-2 py-0.5 rounded bg-red-900/60 hover:bg-red-800 text-red-200 text-[11px] cursor-pointer"
-                      >
-                        Hủy
-                      </button>
-                    </div>
-                  ) : currentTranslation && !translationIsStale ? (
-                    <>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setReadingViewMode((prev) => {
-                            const next = prev === 'translated' ? 'original' : 'translated';
-                            setCurrentPageIndex(0);
-                            setEditingParagraphIndex(null);
-                            return next;
-                          });
-                          setShowMoreMenu(false);
-                        }}
-                        className="w-full flex items-center justify-between px-3 py-2 hover:bg-neutral-800 text-left transition-colors cursor-pointer"
-                      >
-                        <span className="flex items-center space-x-2">
-                          <Languages className="w-3.5 h-3.5 text-emerald-400" />
+                    <div className="px-3 py-2 space-y-1.5 bg-neutral-800/60 mx-1.5 rounded-lg">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="flex items-center space-x-2 text-cyan-300">
+                          <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
                           <span>
-                            {isViewingTranslation ? 'Chuyển sang Nguyên văn' : 'Xem Bản dịch đã lưu'}
+                            Đang dịch truyện
+                            {translationProgress
+                              ? ` (${translationProgress.completedChapters}/${translationProgress.totalChapters} ch.)`
+                              : '...'}
                           </span>
                         </span>
-                        <span
-                          className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
-                            isViewingTranslation
-                              ? 'bg-emerald-600/30 text-emerald-300'
-                              : 'bg-neutral-800 text-neutral-400'
-                          }`}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            translationAbortRef.current?.abort();
+                            setShowMoreMenu(false);
+                          }}
+                          className="px-2 py-0.5 rounded bg-red-900/60 hover:bg-red-800 text-red-200 text-[11px] cursor-pointer"
                         >
-                          {isViewingTranslation ? 'Bản dịch' : 'Nguyên văn'}
-                        </span>
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setShowMoreMenu(false);
-                          handleTranslateCurrentChapter();
-                        }}
-                        className="w-full flex items-center justify-between px-3 py-2 hover:bg-neutral-800 text-left transition-colors cursor-pointer"
-                      >
-                        <span className="flex items-center space-x-2">
-                          <RefreshCw
-                            className={`w-3.5 h-3.5 ${
-                              dictionaryChangedSinceTranslation ? 'text-amber-400' : 'text-neutral-400'
-                            }`}
+                          Hủy
+                        </button>
+                      </div>
+                      {translationProgress && translationProgress.totalChapters > 0 && (
+                        <div className="w-full h-1.5 rounded-full bg-neutral-900 overflow-hidden">
+                          <div
+                            className="h-full bg-cyan-400 transition-all duration-200"
+                            style={{
+                              width: `${Math.round(
+                                (translationProgress.completedChapters /
+                                  Math.max(1, translationProgress.totalChapters)) *
+                                  100
+                              )}%`,
+                            }}
                           />
-                          <span>Dịch lại chương</span>
-                        </span>
-                        {dictionaryChangedSinceTranslation && (
-                          <span className="text-[10px] text-amber-400 font-medium">Từ điển mới</span>
-                        )}
-                      </button>
-                    </>
+                        </div>
+                      )}
+                    </div>
                   ) : (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setShowMoreMenu(false);
-                        handleTranslateCurrentChapter();
-                      }}
-                      className="w-full flex items-center justify-between px-3 py-2 hover:bg-neutral-800 text-left transition-colors cursor-pointer"
-                    >
-                      <span className="flex items-center space-x-2">
-                        <Languages className="w-3.5 h-3.5 text-cyan-400" />
-                        <span>
-                          {translationIsStale ? 'Dịch lại chương (bản cũ hết hạn)' : 'Dịch chương'}
-                        </span>
-                      </span>
-                    </button>
+                    <>
+                      {currentTranslation && !translationIsStale && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setReadingViewMode((prev) => {
+                              const next = prev === 'translated' ? 'original' : 'translated';
+                              setCurrentPageIndex(0);
+                              setEditingParagraphIndex(null);
+                              return next;
+                            });
+                            setShowMoreMenu(false);
+                          }}
+                          className="w-full flex items-center justify-between px-3 py-2 hover:bg-neutral-800 text-left transition-colors cursor-pointer"
+                        >
+                          <span className="flex items-center space-x-2">
+                            <Languages className="w-3.5 h-3.5 text-emerald-400" />
+                            <span>
+                              {isViewingTranslation ? 'Chuyển sang Nguyên văn' : 'Xem Bản dịch đã lưu'}
+                            </span>
+                          </span>
+                          <span
+                            className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                              isViewingTranslation
+                                ? 'bg-emerald-600/30 text-emerald-300'
+                                : 'bg-neutral-800 text-neutral-400'
+                            }`}
+                          >
+                            {isViewingTranslation ? 'Bản dịch' : 'Nguyên văn'}
+                          </span>
+                        </button>
+                      )}
+
+                      {bookTranslatedCount < localChapters.length && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowMoreMenu(false);
+                            handleTranslateBook({ retranslateAll: false });
+                          }}
+                          className="w-full flex items-center justify-between px-3 py-2 hover:bg-neutral-800 text-left transition-colors cursor-pointer"
+                        >
+                          <span className="flex items-center space-x-2">
+                            <Languages className="w-3.5 h-3.5 text-cyan-400" />
+                            <span>
+                              {bookTranslatedCount > 0 ? 'Dịch tiếp toàn truyện' : 'Dịch truyện'}
+                            </span>
+                          </span>
+                          <span className="text-[10px] font-mono text-cyan-300/90">
+                            {bookTranslatedCount > 0
+                              ? `${bookTranslatedCount}/${localChapters.length}`
+                              : `${localChapters.length} ch.`}
+                          </span>
+                        </button>
+                      )}
+
+                      {(bookTranslatedCount > 0 || translationIsStale) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowMoreMenu(false);
+                            handleTranslateBook({ retranslateAll: true });
+                          }}
+                          className="w-full flex items-center justify-between px-3 py-2 hover:bg-neutral-800 text-left transition-colors cursor-pointer"
+                        >
+                          <span className="flex items-center space-x-2">
+                            <RefreshCw
+                              className={`w-3.5 h-3.5 ${
+                                dictionaryChangedSinceTranslation || translationIsStale
+                                  ? 'text-amber-400'
+                                  : 'text-neutral-400'
+                              }`}
+                            />
+                            <span>
+                              {translationIsStale
+                                ? 'Dịch lại toàn truyện (bản cũ hết hạn)'
+                                : 'Dịch lại toàn truyện'}
+                            </span>
+                          </span>
+                          {dictionaryChangedSinceTranslation && (
+                            <span className="text-[10px] text-amber-400 font-medium">Từ điển mới</span>
+                          )}
+                        </button>
+                      )}
+                    </>
                   )}
 
                   <button
@@ -2641,12 +2802,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                           {(translationIsStale || dictionaryChangedSinceTranslation) && (
                             <button
                               type="button"
-                              onClick={handleTranslateCurrentChapter}
+                              onClick={() => handleTranslateBook({ retranslateAll: true })}
                               disabled={isTranslating}
                               className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 border border-amber-500 text-white text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
                             >
                               <RefreshCw className="w-3.5 h-3.5" />
-                              <span>Dịch lại</span>
+                              <span>Dịch lại toàn truyện</span>
                             </button>
                           )}
                         </div>
@@ -2654,7 +2815,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                       {isTranslating && (
                         <div className="flex items-center space-x-2 text-[11px] opacity-85">
                           <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                          <span>Đang dịch chương...</span>
+                          <span>
+                            {translationProgress
+                              ? `Đang dịch truyện (${translationProgress.completedChapters}/${translationProgress.totalChapters} ch. • Chương ${translationProgress.currentChapterNumber})`
+                              : 'Đang dịch truyện...'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => translationAbortRef.current?.abort()}
+                            className="px-2 py-0.5 rounded bg-red-900/40 border border-red-700/40 text-red-300 hover:bg-red-900/60 cursor-pointer"
+                          >
+                            Hủy
+                          </button>
                         </div>
                       )}
                       {translationError && (
@@ -2845,34 +3017,83 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                         className="mt-4 flex flex-col items-center gap-2 font-sans text-xs"
                       >
                         {currentTranslation && (
-                          <div className="inline-flex items-center rounded-lg border border-black/15 dark:border-white/15 bg-black/5 dark:bg-white/5 p-0.5">
+                          <div className="flex flex-wrap items-center justify-center gap-2">
+                            <div className="inline-flex items-center rounded-lg border border-black/15 dark:border-white/15 bg-black/5 dark:bg-white/5 p-0.5">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setReadingViewMode('original');
+                                  setEditingParagraphIndex(null);
+                                }}
+                                className={`px-3 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer ${
+                                  readingViewMode === 'original'
+                                    ? 'bg-amber-600 text-white shadow-xs'
+                                    : 'opacity-75 hover:opacity-100'
+                                }`}
+                              >
+                                Nguyên văn
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setReadingViewMode('translated');
+                                  setEditingParagraphIndex(null);
+                                }}
+                                className={`px-3 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer ${
+                                  readingViewMode === 'translated'
+                                    ? 'bg-emerald-600 text-white shadow-xs'
+                                    : 'opacity-75 hover:opacity-100'
+                                }`}
+                              >
+                                Bản dịch
+                              </button>
+                            </div>
+
+                            {(translationIsStale || dictionaryChangedSinceTranslation) && (
+                              <button
+                                type="button"
+                                onClick={() => handleTranslateBook({ retranslateAll: true })}
+                                disabled={isTranslating}
+                                className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 border border-amber-500 text-white text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+                                title="Dịch lại toàn bộ truyện từ nguyên văn"
+                              >
+                                <RefreshCw className="w-3.5 h-3.5" />
+                                <span>Dịch lại toàn truyện</span>
+                              </button>
+                            )}
+                          </div>
+                        )}
+
+                        {isTranslating && (
+                          <div className="flex flex-wrap items-center justify-center gap-2 text-[11px] opacity-90">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            <span>
+                              {translationProgress
+                                ? `Đang dịch truyện (${translationProgress.completedChapters}/${translationProgress.totalChapters} chương • Chương ${translationProgress.currentChapterNumber})`
+                                : 'Đang dịch truyện...'}
+                            </span>
                             <button
                               type="button"
-                              onClick={() => {
-                                setReadingViewMode('original');
-                                setEditingParagraphIndex(null);
-                              }}
-                              className={`px-3 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer ${
-                                readingViewMode === 'original'
-                                  ? 'bg-amber-600 text-white shadow-xs'
-                                  : 'opacity-75 hover:opacity-100'
-                              }`}
+                              onClick={() => translationAbortRef.current?.abort()}
+                              className="px-2 py-0.5 rounded bg-red-900/40 border border-red-700/40 text-red-300 hover:bg-red-900/60 cursor-pointer"
                             >
-                              Nguyên văn
+                              Hủy
                             </button>
+                          </div>
+                        )}
+
+                        {translationError && (
+                          <div className="max-w-lg w-full px-3 py-2 rounded-lg bg-red-950/70 border border-red-700/50 text-red-200 text-[11px] flex items-center justify-between gap-3 text-left">
+                            <div className="flex items-start space-x-2 min-w-0">
+                              <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                              <span className="break-words">{translationError}</span>
+                            </div>
                             <button
                               type="button"
-                              onClick={() => {
-                                setReadingViewMode('translated');
-                                setEditingParagraphIndex(null);
-                              }}
-                              className={`px-3 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer ${
-                                readingViewMode === 'translated'
-                                  ? 'bg-emerald-600 text-white shadow-xs'
-                                  : 'opacity-75 hover:opacity-100'
-                              }`}
+                              onClick={() => handleTranslateBook({ retranslateAll: false })}
+                              className="px-2.5 py-1 rounded bg-red-800/70 hover:bg-red-700 text-white font-semibold shrink-0 cursor-pointer"
                             >
-                              Bản dịch
+                              Thử lại
                             </button>
                           </div>
                         )}
@@ -3046,26 +3267,25 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                       {(translationIsStale || dictionaryChangedSinceTranslation) && (
                         <button
                           type="button"
-                          onClick={handleTranslateCurrentChapter}
+                          onClick={() => handleTranslateBook({ retranslateAll: true })}
                           disabled={isTranslating}
                           className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 border border-amber-500 text-white text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
-                          title="Dịch lại chương từ nguyên văn"
+                          title="Dịch lại toàn bộ truyện từ nguyên văn"
                         >
                           <RefreshCw className="w-3.5 h-3.5" />
-                          <span>Dịch lại</span>
+                          <span>Dịch lại toàn truyện</span>
                         </button>
                       )}
                     </div>
                   )}
 
                   {isTranslating && (
-                    <div className="flex items-center space-x-2 text-[11px] opacity-85">
+                    <div className="flex flex-wrap items-center justify-center gap-2 text-[11px] opacity-90">
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
                       <span>
-                        Đang dịch chương
-                        {translationProgress && translationProgress.totalChunks > 1
-                          ? ` (${translationProgress.completedChunks}/${translationProgress.totalChunks})`
-                          : '...'}
+                        {translationProgress
+                          ? `Đang dịch truyện (${translationProgress.completedChapters}/${translationProgress.totalChapters} chương • Chương ${translationProgress.currentChapterNumber})`
+                          : 'Đang dịch truyện...'}
                       </span>
                       <button
                         type="button"
@@ -3086,13 +3306,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   {translationIsStale && !isTranslating && (
                     <div className="px-3 py-1.5 rounded-lg bg-amber-500/15 border border-amber-500/40 text-amber-400 text-[11px] flex items-center space-x-1.5">
                       <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                      <span>Nguyên văn đã thay đổi — bấm Dịch lại để cập nhật bản dịch.</span>
+                      <span>Nguyên văn đã thay đổi — bấm Dịch lại toàn truyện để cập nhật bản dịch.</span>
                     </div>
                   )}
 
                   {!translationIsStale && dictionaryChangedSinceTranslation && !isTranslating && (
                     <div className="text-[11px] text-amber-400/90">
-                      Từ điển đã cập nhật — bấm Dịch lại để áp dụng thuật ngữ mới.
+                      Từ điển đã cập nhật — bấm Dịch lại toàn truyện để áp dụng thuật ngữ mới.
                     </div>
                   )}
 
@@ -3104,7 +3324,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                       </div>
                       <button
                         type="button"
-                        onClick={handleTranslateCurrentChapter}
+                        onClick={() => handleTranslateBook({ retranslateAll: false })}
                         className="px-2.5 py-1 rounded bg-red-800/70 hover:bg-red-700 text-white font-semibold shrink-0 cursor-pointer"
                       >
                         Thử lại
@@ -3373,13 +3593,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               : selectionTooltip.text
           }
           sourceParagraph={(() => {
-            if (selectionTooltip.paragraphIndex === undefined) {
-              return currentChapter.content;
-            }
             const srcRaw = (currentTranslation?.sourceContent || currentChapter.content || '')
               .split('\n')
               .filter((p) => p.trim().length > 0);
-            return srcRaw[selectionTooltip.paragraphIndex] || currentChapter.content;
+            if (selectionTooltip.paragraphIndex === undefined) {
+              return currentChapter.content;
+            }
+            const dispPara = paragraphs[selectionTooltip.paragraphIndex] || selectionTooltip.text;
+            return (
+              findBestMatchingSourceParagraph({
+                viParagraph: dispPara,
+                paragraphIndex: selectionTooltip.paragraphIndex,
+                totalViParagraphs: paragraphs.length,
+                sourceParagraphs: srcRaw,
+              }) || currentChapter.content
+            );
           })()}
           selectionStartInPara={selectionTooltip.startInPara ?? 0}
           selectionEndInPara={

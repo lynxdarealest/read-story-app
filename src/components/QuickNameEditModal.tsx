@@ -160,12 +160,9 @@ export const QuickNameEditModal: React.FC<QuickNameEditModalProps> = ({
   // Update HanViet & Name Eng automatically when user edits Tiếng Trung input directly
   const handleZhInputChange = (nextZh: string) => {
     setZhValue(nextZh);
-    if (!manualEdits.hv) {
-      setHvValue(toHanViet(nextZh, hvUppercase));
-    }
-    if (!manualEdits.eng) {
-      setEngValue(toEnglishNameSuggestion(nextZh));
-    }
+    setHvValue(toHanViet(nextZh, hvUppercase));
+    setEngValue(toEnglishNameSuggestion(nextZh));
+    setManualEdits((prev) => ({ ...prev, hv: false, eng: false }));
   };
 
   // Background lookup for cleaner Name Eng (never overwrites user manual edits)

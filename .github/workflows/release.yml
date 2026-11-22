@@ -1,4 +1,4 @@
-name: Build and publish VBook release
+name: Build and publish LYNX Reader release
 
 on:
   push:

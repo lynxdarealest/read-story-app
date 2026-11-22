@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag, for example v0.1.2'
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -16,7 +25,7 @@ jobs:
   release-windows:
     runs-on: windows-latest
     steps:
-      - name: Check out tagged source
+      - name: Check out release source
         uses: actions/checkout@v7
 
       - name: Set up Node.js
@@ -31,7 +40,12 @@ jobs:
       - name: Set package version from release tag
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".Substring(1)
+          $tag = $env:RELEASE_TAG.Trim()
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            Write-Error "Release tag must look like v0.1.2; received '$tag'."
+            exit 1
+          }
+          $version = $tag.Substring(1)
           $currentVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
           if ($currentVersion -ne $version) {
             npm version $version --no-git-tag-version
@@ -41,10 +55,10 @@ jobs:
       - name: Create draft release
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = $env:RELEASE_TAG.Trim()
           gh release view $tag --repo "${{ github.repository }}" *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --repo "${{ github.repository }}" --draft --title "VBook Desktop $tag" --notes "Windows installer for VBook Desktop $tag."
+            gh release create $tag --repo "${{ github.repository }}" --draft --target "${{ github.sha }}" --title "VBook Desktop $tag" --notes "Windows installer for VBook Desktop $tag."
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
         env:
@@ -58,7 +72,7 @@ jobs:
       - name: Publish completed release
         shell: pwsh
         run: |
-          gh release edit "${{ github.ref_name }}" --repo "${{ github.repository }}" --draft=false
+          gh release edit "$env:RELEASE_TAG" --repo "${{ github.repository }}" --draft=false
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
